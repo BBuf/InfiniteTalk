@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import subprocess
 from typing import Tuple
@@ -12,10 +10,9 @@ from einops import rearrange
 from transformers import Wav2Vec2FeatureExtractor
 
 from src.audio_analysis.wav2vec2 import Wav2Vec2Model
-
+import torch
 
 def custom_init(device: str, wav2vec_dir: str) -> Tuple[Wav2Vec2FeatureExtractor, torch.nn.Module]:
-    import torch
     audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec_dir, local_files_only=True).to(device)
     audio_encoder.feature_extractor._freeze_parameters()
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_dir, local_files_only=True)
@@ -72,7 +69,6 @@ def get_embedding(
     sr: int = 16000,
     device: str = "cpu",
 ) -> torch.Tensor:
-    import torch
     audio_duration = len(speech_array) / sr
     video_length = audio_duration * 25  # assume fps 25
 
