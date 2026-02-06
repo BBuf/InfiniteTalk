@@ -17,6 +17,7 @@ def _write_file_sync(file_path: Path, content: bytes) -> None:
         buffer.write(content)
 
 
+@router.post("", response_model=TaskResponse, include_in_schema=False)
 @router.post("/", response_model=TaskResponse)
 async def create_video_task(message: VideoTaskRequest):
     try:
