@@ -39,6 +39,9 @@ class ApiServer:
             self.processing_thread.start()
             logger.info("Started task processing thread")
 
+    def start_processing(self):
+        self._ensure_processing_thread_running()
+
     def _task_processing_loop(self):
         logger.info("Task processing loop started")
 
@@ -110,7 +113,9 @@ class ApiServer:
     def initialize_services(self, cache_dir: Path, inference_service: DistributedInferenceService):
         container = ServiceContainer.get_instance()
         container.initialize(cache_dir, inference_service, self.max_queue_size)
-        self._ensure_processing_thread_running()
+        # Do NOT start processing loop here.
+        # In InfiniteTalk, model init can be slow; we start FastAPI first and bring up
+        # the processing loop only after inference worker is ready.
 
     async def cleanup(self):
         self.stop_processing.set()

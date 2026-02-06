@@ -8,7 +8,10 @@ router = APIRouter()
 
 @router.get("/status")
 async def get_service_status():
-    return task_manager.get_service_status()
+    services = get_services()
+    status = task_manager.get_service_status()
+    status["inference_ready"] = bool(services.inference_service and services.inference_service.is_running)
+    return status
 
 
 @router.get("/metadata")
