@@ -1,7 +1,6 @@
 import os
 import signal
 import sys
-import threading
 from pathlib import Path
 
 import uvicorn
@@ -47,6 +46,9 @@ def run_server(args):
             raise RuntimeError("Invalid server configuration")
 
         inference_service = DistributedInferenceService()
+        if not inference_service.start_distributed_inference(args):
+            raise RuntimeError("Failed to start distributed inference service")
+        logger.info(f"Rank {rank}: Inference service started successfully")
 
         if rank == 0:
             cache_dir = Path(server_config.cache_dir)
@@ -57,24 +59,9 @@ def run_server(args):
 
             app = api_server.get_app()
 
-            def _init_inference_background():
-                try:
-                    if not inference_service.start_distributed_inference(args):
-                        raise RuntimeError("Failed to start distributed inference service")
-                    logger.info(f"Rank {rank}: Inference service started successfully")
-                    api_server.start_processing()
-                except Exception as e:
-                    logger.error(f"Rank {rank}: Inference init failed: {e}")
-
-            t = threading.Thread(target=_init_inference_background, daemon=True)
-            t.start()
-
             logger.info(f"Starting FastAPI server on {server_config.host}:{server_config.port}")
             uvicorn.run(app, host=server_config.host, port=server_config.port, log_level="info")
         else:
-            if not inference_service.start_distributed_inference(args):
-                raise RuntimeError("Failed to start distributed inference service")
-            logger.info(f"Rank {rank}: Inference service started successfully")
             logger.info(f"Rank {rank}: Starting worker loop")
             import asyncio
 
