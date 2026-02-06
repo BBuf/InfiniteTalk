@@ -1,0 +1,267 @@
+import asyncio
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from loguru import logger
+
+from ..distributed_utils import DistributedManager
+from .infinitetalk_audio import audio_prepare_single, custom_init, get_embedding, save_wav_16k
+
+
+def _round_to_4n_plus_1(frames: int, min_frames: int = 5) -> int:
+    frames = max(frames, min_frames)
+    # nearest <= frames that satisfies 4n+1
+    return (max((frames - 1) // 4, 1) * 4) + 1
+
+
+class TorchrunInferenceWorker:
+    def __init__(self):
+        self.rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.dist_manager = DistributedManager()
+        self.processing = False
+
+        self.pipeline = None
+        self.wav2vec_feature_extractor = None
+        self.audio_encoder = None
+
+        # defaults (can be overridden by request fields)
+        self.default_size = "infinitetalk-480"
+        self.default_motion_frame = 9
+        self.default_sample_shift = None
+        self.default_text_guide_scale = 5.0
+        self.default_audio_guide_scale = 4.0
+        self.default_offload_model = True
+        self.default_max_frame_num = 1000
+
+    def init(self, args) -> bool:
+        try:
+            try:
+                import torch  # local import for better startup ergonomics
+            except ModuleNotFoundError as e:
+                raise RuntimeError("Missing dependency: torch. Please install PyTorch before starting serving.") from e
+
+            import wan  # local import (requires project deps)
+            from wan.configs import WAN_CONFIGS
+
+            if self.world_size > 1:
+                if not self.dist_manager.init_process_group():
+                    raise RuntimeError("Failed to initialize distributed process group")
+            else:
+                self.dist_manager.rank = 0
+                self.dist_manager.world_size = 1
+                self.dist_manager.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+                self.dist_manager.is_initialized = False
+
+            # Parse required model args
+            ckpt_dir = getattr(args, "ckpt_dir", None)
+            wav2vec_dir = getattr(args, "wav2vec_dir", None)
+            infinitetalk_dir = getattr(args, "infinitetalk_dir", None)
+            quant_dir = getattr(args, "quant_dir", None)
+            quant = getattr(args, "quant", None)
+            dit_path = getattr(args, "dit_path", None)
+
+            if not ckpt_dir or not wav2vec_dir or not infinitetalk_dir:
+                raise RuntimeError("--ckpt_dir, --wav2vec_dir, --infinitetalk_dir are required")
+
+            self.default_size = getattr(args, "size", self.default_size) or self.default_size
+            self.default_motion_frame = int(getattr(args, "motion_frame", self.default_motion_frame) or self.default_motion_frame)
+            self.default_text_guide_scale = float(getattr(args, "sample_text_guide_scale", self.default_text_guide_scale) or self.default_text_guide_scale)
+            self.default_audio_guide_scale = float(getattr(args, "sample_audio_guide_scale", self.default_audio_guide_scale) or self.default_audio_guide_scale)
+            self.default_offload_model = bool(getattr(args, "offload_model", self.default_offload_model))
+            self.default_max_frame_num = int(getattr(args, "max_frame_num", self.default_max_frame_num) or self.default_max_frame_num)
+
+            # shift default depends on size if not specified
+            self.default_sample_shift = getattr(args, "sample_shift", None)
+            if self.default_sample_shift is None:
+                if self.default_size == "infinitetalk-480":
+                    self.default_sample_shift = 7
+                elif self.default_size == "infinitetalk-720":
+                    self.default_sample_shift = 11
+
+            cfg = WAN_CONFIGS["infinitetalk-14B"]
+
+            # Init wav2vec on CPU (shared for all requests)
+            self.wav2vec_feature_extractor, self.audio_encoder = custom_init("cpu", wav2vec_dir)
+
+            # Init InfiniteTalk pipeline (GPU)
+            device_id = self.rank if torch.cuda.is_available() else 0
+            self.pipeline = wan.InfiniteTalkPipeline(
+                config=cfg,
+                checkpoint_dir=ckpt_dir,
+                quant_dir=quant_dir,
+                device_id=device_id,
+                rank=self.rank,
+                t5_fsdp=getattr(args, "t5_fsdp", False),
+                dit_fsdp=getattr(args, "dit_fsdp", False),
+                use_usp=bool(getattr(args, "ulysses_size", 1) > 1 or getattr(args, "ring_size", 1) > 1),
+                t5_cpu=getattr(args, "t5_cpu", False),
+                lora_dir=getattr(args, "lora_dir", None),
+                lora_scales=getattr(args, "lora_scale", None),
+                quant=quant,
+                dit_path=dit_path,
+                infinitetalk_dir=infinitetalk_dir,
+            )
+
+            num_persistent = getattr(args, "num_persistent_param_in_dit", None)
+            if num_persistent is not None:
+                self.pipeline.vram_management = True
+                self.pipeline.enable_vram_management(num_persistent_param_in_dit=num_persistent)
+
+            logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed")
+            return True
+
+        except Exception as e:
+            logger.exception(f"Rank {self.rank} initialization failed: {str(e)}")
+            return False
+
+    async def process_request(self, task_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        has_error = False
+        error_msg = ""
+
+        try:
+            import torch  # local import
+            from wan.utils.multitalk_utils import save_video_ffmpeg
+
+            if self.world_size > 1 and self.rank == 0:
+                task_data = self.dist_manager.broadcast_task_data(task_data)
+
+            # Extract inputs (LightX2V-compatible fields)
+            task_id = task_data["task_id"]
+            prompt = task_data.get("prompt", "")
+            cond_media_path = task_data.get("image_path", "")
+            audio_path = task_data.get("audio_path", "")
+            save_result_path = task_data.get("save_result_path", "")
+
+            if not cond_media_path:
+                raise RuntimeError("image_path is required (can be image or video)")
+            if not audio_path:
+                raise RuntimeError("audio_path is required for InfiniteTalk")
+            if not save_result_path:
+                raise RuntimeError("save_result_path is required")
+
+            # Map controls
+            sampling_steps = int(task_data.get("infer_steps", 40))
+            seed = int(task_data.get("seed", 42))
+            fps = int(task_data.get("target_fps", 25) or 25)
+
+            # InfiniteTalk-specific overrides (optional)
+            size = task_data.get("size") or self.default_size
+            motion_frame = int(task_data.get("motion_frame") or self.default_motion_frame)
+            shift = float(task_data.get("sample_shift") or self.default_sample_shift)
+            text_guide_scale = float(task_data.get("text_guide_scale") or self.default_text_guide_scale)
+            audio_guide_scale = float(task_data.get("audio_guide_scale") or self.default_audio_guide_scale)
+            max_frames_num = int(task_data.get("max_frame_num") or task_data.get("target_video_length") or self.default_max_frame_num)
+
+            # Decide clip length (frame_num) and streaming total length (max_frames_num)
+            target_len = int(task_data.get("target_video_length", 81))
+            if max_frames_num < target_len:
+                max_frames_num = target_len
+            frame_num = _round_to_4n_plus_1(min(81, target_len))
+            # If user wants longer than one chunk, use streaming and max_frames_num
+            mode_streaming = max_frames_num > frame_num
+
+            output_path = Path(save_result_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_base = str(output_path.with_suffix(""))  # save_video_ffmpeg appends .mp4
+
+            work_dir = output_path.parent / f"{task_id}_work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            # Prepare audio embedding (CPU)
+            speech = audio_prepare_single(audio_path, sample_rate=16000, tmp_dir=str(work_dir))
+            audio_emb = get_embedding(speech, self.wav2vec_feature_extractor, self.audio_encoder, sr=16000, device="cpu")
+
+            emb_path = str(work_dir / "1.pt")
+            torch.save(audio_emb, emb_path)
+
+            # Also ensure we have a wav for mux/cropping
+            wav_path = str(work_dir / "audio_16k.wav")
+            save_wav_16k(speech, wav_path, sr=16000)
+
+            input_data = {
+                "prompt": prompt,
+                "cond_video": cond_media_path,
+                "cond_audio": {"person1": emb_path},
+                "video_audio": wav_path,
+            }
+
+            # Run pipeline (GPU heavy)
+            extra_args = type("ExtraArgs", (), {})()
+            # APG/TeaCache are opt-in; keep off by default.
+            extra_args.use_teacache = bool(task_data.get("use_teacache", False))
+            extra_args.teacache_thresh = float(task_data.get("teacache_thresh", 0.2))
+            extra_args.size = size
+            extra_args.use_apg = bool(task_data.get("use_apg", False))
+            extra_args.apg_momentum = float(task_data.get("apg_momentum", -0.75))
+            extra_args.apg_norm_threshold = float(task_data.get("apg_norm_threshold", 55))
+
+            video_tensor = self.pipeline.generate_infinitetalk(
+                input_data,
+                size_buckget=size,
+                motion_frame=motion_frame,
+                frame_num=frame_num,
+                shift=shift,
+                sampling_steps=sampling_steps,
+                text_guide_scale=text_guide_scale,
+                audio_guide_scale=audio_guide_scale,
+                seed=seed,
+                offload_model=self.default_offload_model,
+                max_frames_num=max_frames_num if mode_streaming else frame_num,
+                color_correction_strength=float(task_data.get("color_correction_strength", 0.0)),
+                extra_args=extra_args,
+            )
+
+            if self.world_size > 1:
+                self.dist_manager.barrier()
+
+            if self.rank == 0:
+                # Save mp4 with audio
+                save_video_ffmpeg(video_tensor, output_base, [wav_path], fps=fps, high_quality_save=False)
+
+        except Exception as e:
+            has_error = True
+            error_msg = str(e)
+            logger.exception(f"Rank {self.rank} inference failed: {error_msg}")
+
+        if self.world_size > 1:
+            self.dist_manager.barrier()
+
+        if self.rank == 0:
+            if has_error:
+                return {"task_id": task_data.get("task_id", "unknown"), "status": "failed", "error": error_msg, "message": f"Inference failed: {error_msg}"}
+            return {
+                "task_id": task_data["task_id"],
+                "status": "success",
+                "save_result_path": task_data.get("video_path", Path(task_data["save_result_path"]).name),
+                "message": "Inference completed",
+            }
+        return None
+
+    async def worker_loop(self):
+        while True:
+            task_data = None
+            try:
+                task_data = self.dist_manager.broadcast_task_data()
+                if task_data is None:
+                    logger.info(f"Rank {self.rank} received stop signal")
+                    break
+                await self.process_request(task_data)
+            except Exception as e:
+                error_str = str(e)
+                if "Connection closed by peer" in error_str or "Connection reset by peer" in error_str:
+                    logger.info(f"Rank {self.rank} detected master process shutdown, exiting worker loop")
+                    break
+                logger.error(f"Rank {self.rank} worker loop error: {error_str}")
+                if self.world_size > 1 and task_data is not None:
+                    try:
+                        self.dist_manager.barrier()
+                    except Exception as barrier_error:
+                        logger.warning(f"Rank {self.rank} barrier failed, exiting: {barrier_error}")
+                        break
+                continue
+
+    def cleanup(self):
+        self.dist_manager.cleanup()
+

@@ -19,3 +19,7 @@ optimum-quanto==0.2.6
 scenedetect
 moviepy==1.0.3
 decord
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.25
+python-multipart>=0.0.9
