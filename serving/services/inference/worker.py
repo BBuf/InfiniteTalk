@@ -74,9 +74,39 @@ class TorchrunInferenceWorker:
             quant_dir = getattr(args, "quant_dir", None)
             quant = getattr(args, "quant", None)
             dit_path = getattr(args, "dit_path", None)
+            ulysses_size = int(getattr(args, "ulysses_size", 1) or 1)
+            ring_size = int(getattr(args, "ring_size", 1) or 1)
 
             if not ckpt_dir or not wav2vec_dir or not infinitetalk_dir:
                 raise RuntimeError("--ckpt_dir, --wav2vec_dir, --infinitetalk_dir are required")
+
+            # Initialize xfuser model parallel groups when USP (ulysses/ring) is enabled.
+            # This mirrors `generate_infinitetalk.py` behavior and avoids:
+            # AssertionError: pipeline model parallel group is not initialized
+            if ulysses_size > 1 or ring_size > 1:
+                if self.world_size <= 1:
+                    raise RuntimeError("ulysses_size/ring_size > 1 requires torchrun (WORLD_SIZE > 1)")
+                if ulysses_size * ring_size != self.world_size:
+                    raise RuntimeError(
+                        f"ulysses_size*ring_size must equal WORLD_SIZE. "
+                        f"Got {ulysses_size=} {ring_size=} {self.world_size=}"
+                    )
+
+                t_mp = time.perf_counter()
+                logger.info(
+                    f"Rank {self.rank}: 初始化 xfuser model-parallel groups "
+                    f"(ulysses_size={ulysses_size}, ring_size={ring_size}) ..."
+                )
+                import torch.distributed as dist
+                from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel
+
+                init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
+                initialize_model_parallel(
+                    sequence_parallel_degree=dist.get_world_size(),
+                    ring_degree=ring_size,
+                    ulysses_degree=ulysses_size,
+                )
+                logger.info(f"Rank {self.rank}: xfuser 并行组初始化完成，用时 {time.perf_counter() - t_mp:.1f}s")
 
             self.default_size = getattr(args, "size", self.default_size) or self.default_size
             self.default_motion_frame = int(getattr(args, "motion_frame", self.default_motion_frame) or self.default_motion_frame)
@@ -115,7 +145,7 @@ class TorchrunInferenceWorker:
                 rank=self.rank,
                 t5_fsdp=getattr(args, "t5_fsdp", False),
                 dit_fsdp=getattr(args, "dit_fsdp", False),
-                use_usp=bool(getattr(args, "ulysses_size", 1) > 1 or getattr(args, "ring_size", 1) > 1),
+                use_usp=bool(ulysses_size > 1 or ring_size > 1),
                 t5_cpu=getattr(args, "t5_cpu", False),
                 lora_dir=getattr(args, "lora_dir", None),
                 lora_scales=getattr(args, "lora_scale", None),
