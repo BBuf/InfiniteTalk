@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infinitetalk"
+version = "0.1.0"
+description = "InfiniteTalk serving utilities (LightX2V-compatible API)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "httpx>=0.25",
+  "python-multipart>=0.0.9",
+  "loguru",
+  "librosa",
+  "soundfile",
+  "pyloudnorm",
+  "einops",
+  "transformers>=4.49.0",
+]
+
+[project.scripts]
+infinitetalk-serving = "serving.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["infinitetalk*", "serving*", "wan*", "kokoro*", "src*"]
+

@@ -23,29 +23,7 @@ InfiniteTalk 内部会根据类型自动走：
 - 图片：直接作为条件帧
 - 视频：从视频中抽取稀疏帧作为条件帧
 
-### 启动
-
-在 `InfiniteTalk/` 目录下运行：
-
-```bash
-pip install -r requirements.txt
-
-python -m serving \
-  --ckpt_dir weights/Wan2.1-I2V-14B-480P \
-  --wav2vec_dir weights/chinese-wav2vec2-base \
-  --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
-  --host 0.0.0.0 --port 8000
-```
-
-多 GPU（可选）：
-
-```bash
-torchrun --nproc_per_node=2 -m serving \
-  --ckpt_dir ... --wav2vec_dir ... --infinitetalk_dir ... \
-  --host 0.0.0.0 --port 8000
-```
-
-#### 4 GPU + Ulysses=4（推荐）
+### 启动（4 GPU + Ulysses=4，推荐）
 
 说明：
 - `--nproc_per_node=4`：4 张卡
@@ -53,10 +31,54 @@ torchrun --nproc_per_node=2 -m serving \
 - serving 对 **Image-to-Video** / **Video-to-Video** 的启动命令是一样的，区别在 client 传参时 `image_path` 指向图片还是视频
 
 ```bash
+W=/nas/shared/models/InfiniteTalk/weights
+
 torchrun --nproc_per_node=4 -m serving \
-  --ckpt_dir weights/Wan2.1-I2V-14B-480P \
-  --wav2vec_dir weights/chinese-wav2vec2-base \
-  --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
+  --ckpt_dir ${W}/Wan2.1-I2V-14B-480P \
+  --wav2vec_dir ${W}/chinese-wav2vec2-base \
+  --infinitetalk_dir ${W}/InfiniteTalk/single/infinitetalk.safetensors \
+  --dit_fsdp --t5_fsdp \
+  --ulysses_size 4 \
+  --size infinitetalk-480 \
+  --motion_frame 9 \
+  --sample_shift 7 \
+  --sample_text_guide_scale 5 \
+  --sample_audio_guide_scale 4 \
+  --host 0.0.0.0 --port 8000
+```
+
+### 启动（pip 安装后直接运行）
+
+如果你希望“直接 pip 安装出 `infinitetalk.serving`”，可以在仓库根目录（`InfiniteTalk/`）执行：
+
+```bash
+pip install -e .
+
+W=/nas/shared/models/InfiniteTalk/weights
+
+torchrun --nproc_per_node=4 -m infinitetalk.serving \
+  --ckpt_dir ${W}/Wan2.1-I2V-14B-480P \
+  --wav2vec_dir ${W}/chinese-wav2vec2-base \
+  --infinitetalk_dir ${W}/InfiniteTalk/single/infinitetalk.safetensors \
+  --dit_fsdp --t5_fsdp \
+  --ulysses_size 4 \
+  --size infinitetalk-480 \
+  --motion_frame 9 \
+  --sample_shift 7 \
+  --sample_text_guide_scale 5 \
+  --sample_audio_guide_scale 4 \
+  --host 0.0.0.0 --port 8000
+```
+
+也可以用 console script：
+
+```bash
+W=/nas/shared/models/InfiniteTalk/weights
+
+torchrun --nproc_per_node=4 infinitetalk-serving \
+  --ckpt_dir ${W}/Wan2.1-I2V-14B-480P \
+  --wav2vec_dir ${W}/chinese-wav2vec2-base \
+  --infinitetalk_dir ${W}/InfiniteTalk/single/infinitetalk.safetensors \
   --dit_fsdp --t5_fsdp \
   --ulysses_size 4 \
   --size infinitetalk-480 \
