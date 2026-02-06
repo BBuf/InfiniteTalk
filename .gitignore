@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv / conda
+venv/
+.venv/
+env/
+.env/
+
+# Serving cache
+serving/server_cache/
+server_cache/
+
+# Outputs / temp
+save_audio/
+tmp/
+*.mp4
+*.wav
