@@ -22,12 +22,28 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
+import sys
 import warnings
 
 __all__ = [
     'flash_attention',
     'attention',
 ]
+
+
+_WARN_ONCE_KEYS = set()
+
+
+def _warn(msg: str):
+    print(f"[ATTN][WARN] {msg}", file=sys.stderr, flush=True)
+
+
+def _warn_once(key: str, msg: str):
+    if key in _WARN_ONCE_KEYS:
+        return
+    _WARN_ONCE_KEYS.add(key)
+    # Use direct stderr print to avoid warnings filters / tqdm stderr refresh hiding the message.
+    print(f"[ATTN][ONCE] {msg}", file=sys.stderr, flush=True)
 
 
 def flash_attention(
@@ -58,6 +74,87 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    q_in, k_in, v_in = q, k, v
+
+    def _sdpa_fallback():
+        # Slower but keeps inference runnable.
+        if q_lens is not None or k_lens is not None:
+            _warn_once(
+                "sdpa_padding_mask_disabled",
+                "Padding mask is disabled when using scaled_dot_product_attention fallback. "
+                "It can have a significant impact on performance.",
+            )
+
+        q_sdpa = q_in.transpose(1, 2).to(dtype)
+        k_sdpa = k_in.transpose(1, 2).to(dtype)
+        v_sdpa = v_in.transpose(1, 2).to(dtype)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=None,
+            is_causal=causal,
+            dropout_p=dropout_p,
+        )
+        return out.transpose(1, 2).contiguous().to(q_in.dtype)
+
+    def _fa3_varlen(q_packed, k_packed, v_packed, q_lens_local, k_lens_local, lq_local, lk_local, b_local):
+        """
+        flash_attn_interface.flash_attn_varlen_func wrappers can differ across packages.
+        This adapter tries a few common output layouts and reshapes to [B, Lq, H, D].
+        """
+        cu_q = torch.cat([q_lens_local.new_zeros([1]), q_lens_local]).cumsum(0, dtype=torch.int32).to(
+            q_packed.device, non_blocking=True
+        )
+        cu_k = torch.cat([k_lens_local.new_zeros([1]), k_lens_local]).cumsum(0, dtype=torch.int32).to(
+            q_packed.device, non_blocking=True
+        )
+
+        out = flash_attn_interface.flash_attn_varlen_func(
+            q=q_packed,
+            k=k_packed,
+            v=v_packed,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=lq_local,
+            max_seqlen_k=lk_local,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            deterministic=deterministic,
+        )
+
+        x = out[0] if isinstance(out, (tuple, list)) else out
+
+        # Expected "packed" layout is typically [total_q, H, D]
+        total_q = int(q_lens_local.sum().item())
+        if x.dim() == 4 and x.shape[0] == b_local and x.shape[1] == lq_local:
+            return x  # already [B, Lq, H, D]
+        if x.dim() == 3 and x.shape[0] == total_q:
+            return x.unflatten(0, (b_local, lq_local))
+        if x.dim() == 3 and x.shape[1] == total_q:
+            # [H, total_q, D] -> [total_q, H, D]
+            return x.permute(1, 0, 2).contiguous().unflatten(0, (b_local, lq_local))
+
+        raise RuntimeError(f"Unexpected FA3 varlen output shape: {tuple(x.shape)} (total_q={total_q}, b={b_local}, lq={lq_local})")
+
+    # If a specific flash-attn version is requested but unavailable, degrade gracefully.
+    if version == 2 and not FLASH_ATTN_2_AVAILABLE:
+        if FLASH_ATTN_3_AVAILABLE:
+            _warn_once("fa2_missing_use_fa3", "Flash attention 2 is not available, use flash attention 3 instead.")
+            version = 3
+        else:
+            return _sdpa_fallback()
+    if version == 3 and not FLASH_ATTN_3_AVAILABLE:
+        if FLASH_ATTN_2_AVAILABLE:
+            _warn_once("fa3_missing_use_fa2", "Flash attention 3 is not available, use flash attention 2 instead.")
+            version = 2
+        else:
+            return _sdpa_fallback()
+    if version is None and not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        return _sdpa_fallback()
+
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
@@ -94,29 +191,18 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
 
+    # `version` has been normalized above; keep this branch for safety if called with odd configs.
     if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
-        warnings.warn(
-            'Flash attention 3 is not available, use flash attention 2 instead.'
-        )
+        _warn_once("fa3_missing_safety", "Flash attention 3 is not available, use flash attention 2 instead.")
 
     # apply attention
     if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # Note: dropout_p, window_size are not supported in FA3 now.
-        x = flash_attn_interface.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            seqused_q=None,
-            seqused_k=None,
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
+        try:
+            x = _fa3_varlen(q, k, v, q_lens, k_lens, lq, lk, b)
+        except Exception as e:
+            _warn_once("fa3_failed_sdpa", f"Flash attention 3 failed, falling back to SDPA: {e}")
+            return _sdpa_fallback()
     else:
         assert FLASH_ATTN_2_AVAILABLE
         x = flash_attn.flash_attn_varlen_func(
@@ -172,8 +258,9 @@ def attention(
         )
     else:
         if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+            _warn_once(
+                "sdpa_padding_mask_disabled",
+                "Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.",
             )
         attn_mask = None
 
@@ -263,7 +350,28 @@ class SingleStreamAttention(nn.Module):
             attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
         else:
             attn_bias = None
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
+        try:
+            x = xformers.ops.memory_efficient_attention(
+                q, encoder_k, encoder_v, attn_bias=attn_bias, op=None
+            )
+            _warn_once(
+                "xformers_mea_ok",
+                "xFormers memory_efficient_attention: OK (has been used at least once).",
+            )
+        except NotImplementedError:
+            # xFormers CUDA ops are unavailable in some environments (e.g., wheel built for a different torch/python).
+            # Fall back to PyTorch SDPA / flash-attn wrapper.
+            if attn_bias is not None:
+                _warn_once(
+                    "xformers_sp_attn_bias_dropped",
+                    "xFormers operator not available; falling back to SDPA without attn_bias. "
+                    "This may be incorrect for sequence-parallel mode.",
+                )
+            _warn_once(
+                "xformers_mea_fallback",
+                "xFormers memory_efficient_attention: NOT available -> falling back to PyTorch attention.",
+            )
+            x = attention(q, encoder_k, encoder_v, dropout_p=0.0, causal=False, dtype=q.dtype)
         x = rearrange(x, "B M H K -> B H M K") 
 
         # linear transform
@@ -377,7 +485,18 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
+        try:
+            x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None)
+            _warn_once(
+                "xformers_mea_ok",
+                "xFormers memory_efficient_attention: OK (has been used at least once).",
+            )
+        except NotImplementedError:
+            _warn_once(
+                "xformers_mea_fallback",
+                "xFormers memory_efficient_attention: NOT available -> falling back to PyTorch attention.",
+            )
+            x = attention(q, encoder_k, encoder_v, dropout_p=0.0, causal=False, dtype=q.dtype)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
