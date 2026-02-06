@@ -164,6 +164,7 @@ class InfiniteTalkPipeline:
 
         shard_fn = partial(shard_model, device_id=device_id)
 
+        logging.info("[InfiniteTalkPipeline] [1/5] Loading T5 text encoder ...")
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -174,19 +175,24 @@ class InfiniteTalkPipeline:
             quant=quant,
             quant_dir=os.path.dirname(quant_dir) if quant_dir is not None else None,
         )
+        logging.info("[InfiniteTalkPipeline] [1/5] T5 loaded.")
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        logging.info("[InfiniteTalkPipeline] [2/5] Loading VAE ...")
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
+        logging.info("[InfiniteTalkPipeline] [2/5] VAE loaded.")
 
+        logging.info("[InfiniteTalkPipeline] [3/5] Loading CLIP ...")
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+        logging.info("[InfiniteTalkPipeline] [3/5] CLIP loaded.")
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
@@ -217,10 +223,14 @@ class InfiniteTalkPipeline:
                                 f"{checkpoint_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
                                 f"{infinitetalk_dir}"]
                 merged_state_dict = {}
-                for weight_file in weight_files:
+                logging.info(f"[InfiniteTalkPipeline] [4/5] Loading diffusion weights ({len(weight_files)} files) ...")
+                for idx, weight_file in enumerate(weight_files, start=1):
+                    logging.info(f"[InfiniteTalkPipeline]   - loading {idx}/{len(weight_files)}: {os.path.basename(weight_file)}")
                     sd = load_file(weight_file)
                     merged_state_dict.update(sd)
+                logging.info("[InfiniteTalkPipeline] [4/5] All weights loaded, applying state_dict ...")
                 self.model.load_state_dict(merged_state_dict)
+                logging.info("[InfiniteTalkPipeline] [4/5] state_dict applied.")
                 
             else:
                 init_contexts = [no_init_weights()]

@@ -45,6 +45,12 @@ def run_server(args):
         if not server_config.validate():
             raise RuntimeError("Invalid server configuration")
 
+        if rank == 0:
+            logger.info(
+                "正在初始化推理服务并加载模型（可能需要几分钟，期间 8000 端口不会监听）。"
+                "当你看到“Starting FastAPI server ...”日志后，才表示服务可以被 curl 访问。"
+            )
+
         inference_service = DistributedInferenceService()
         if not inference_service.start_distributed_inference(args):
             raise RuntimeError("Failed to start distributed inference service")

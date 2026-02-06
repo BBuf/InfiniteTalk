@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -37,6 +38,7 @@ class TorchrunInferenceWorker:
 
     def init(self, args) -> bool:
         try:
+            t0 = time.perf_counter()
             try:
                 import torch  # local import for better startup ergonomics
             except ModuleNotFoundError as e:
@@ -45,9 +47,20 @@ class TorchrunInferenceWorker:
             import wan  # local import (requires project deps)
             from wan.configs import WAN_CONFIGS
 
+            # Ensure Wan's internal `logging.info(...)` is visible.
+            import logging
+
+            if not logging.getLogger().handlers:
+                logging.basicConfig(
+                    level=logging.INFO,
+                    format=f"[%(asctime)s][rank={self.rank}] %(levelname)s: %(message)s",
+                )
+
             if self.world_size > 1:
+                logger.info(f"Rank {self.rank}: [1/4] 初始化分布式进程组 ...")
                 if not self.dist_manager.init_process_group():
                     raise RuntimeError("Failed to initialize distributed process group")
+                logger.info(f"Rank {self.rank}: [1/4] 分布式初始化完成，用时 {time.perf_counter() - t0:.1f}s")
             else:
                 self.dist_manager.rank = 0
                 self.dist_manager.world_size = 1
@@ -83,9 +96,16 @@ class TorchrunInferenceWorker:
             cfg = WAN_CONFIGS["infinitetalk-14B"]
 
             # Init wav2vec on CPU (shared for all requests)
+            t_w2v = time.perf_counter()
+            logger.info(f"Rank {self.rank}: [2/4] 加载 wav2vec 到 CPU ...")
             self.wav2vec_feature_extractor, self.audio_encoder = custom_init("cpu", wav2vec_dir)
+            logger.info(f"Rank {self.rank}: [2/4] wav2vec 加载完成，用时 {time.perf_counter() - t_w2v:.1f}s")
 
             # Init InfiniteTalk pipeline (GPU)
+            t_pipe = time.perf_counter()
+            logger.info(
+                f"Rank {self.rank}: [3/4] 加载 InfiniteTalk 主模型权重到 GPU（最耗时阶段）..."
+            )
             device_id = self.rank if torch.cuda.is_available() else 0
             self.pipeline = wan.InfiniteTalkPipeline(
                 config=cfg,
@@ -103,13 +123,19 @@ class TorchrunInferenceWorker:
                 dit_path=dit_path,
                 infinitetalk_dir=infinitetalk_dir,
             )
+            logger.info(f"Rank {self.rank}: [3/4] 主模型加载完成，用时 {time.perf_counter() - t_pipe:.1f}s")
 
             num_persistent = getattr(args, "num_persistent_param_in_dit", None)
             if num_persistent is not None:
+                t_vram = time.perf_counter()
+                logger.info(f"Rank {self.rank}: [4/4] 启用 VRAM 管理 ...")
                 self.pipeline.vram_management = True
                 self.pipeline.enable_vram_management(num_persistent_param_in_dit=num_persistent)
+                logger.info(f"Rank {self.rank}: [4/4] VRAM 管理启用完成，用时 {time.perf_counter() - t_vram:.1f}s")
 
-            logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed")
+            logger.info(
+                f"Rank {self.rank}/{self.world_size - 1} initialization completed, total {time.perf_counter() - t0:.1f}s"
+            )
             return True
 
         except Exception as e:
