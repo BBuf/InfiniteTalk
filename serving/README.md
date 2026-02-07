@@ -111,7 +111,7 @@ torchrun --nproc_per_node=4 infinitetalk-serving \
 #### 1) Video-to-Video（输入视频 + 音频）
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video/" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "a person is talking",
@@ -127,7 +127,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
 #### 2) Image-to-Video（输入图片 + 音频）
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video/" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "a person is talking",
