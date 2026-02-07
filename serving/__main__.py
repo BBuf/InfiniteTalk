@@ -14,6 +14,22 @@ def main():
     parser.add_argument("--quant", type=str, default=None, help="Quantization type: int8 or fp8 (optional)")
     parser.add_argument("--dit_path", type=str, default=None, help="Optional merged dit checkpoint path")
 
+    # LoRA (optional)
+    parser.add_argument(
+        "--lora_dir",
+        type=str,
+        nargs="+",
+        default=None,
+        help="LoRA checkpoint file path(s) (.safetensors). Accepts multiple values.",
+    )
+    parser.add_argument(
+        "--lora_scale",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        help="LoRA scale(s). Must match --lora_dir count if multiple are provided.",
+    )
+
     # Runtime
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port", type=int, default=8000, help="Server port")

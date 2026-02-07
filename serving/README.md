@@ -47,6 +47,47 @@ torchrun --nproc_per_node=4 -m serving \
   --host 0.0.0.0 --port 8000
 ```
 
+### 启动（4 GPU + Ulysses=4 + LoRA + 4 steps 示例）
+
+你图里的配置可以直接照搬到 serving：
+- **LoRA**：通过启动参数 `--lora_dir/--lora_scale` 传入
+- **4 steps**：serving 的步数在 client 请求里用 `infer_steps` 控制（等价于脚本里的 `--sample_steps`）
+
+```bash
+W=/nas/shared/models/InfiniteTalk/weights
+
+torchrun --nproc_per_node=4 -m infinitetalk.serving \
+  --ckpt_dir ${W}/Wan2.1-I2V-14B-480P \
+  --wav2vec_dir ${W}/chinese-wav2vec2-base \
+  --infinitetalk_dir ${W}/InfiniteTalk/single/infinitetalk.safetensors \
+  --lora_dir ${W}/Wan2.1-Distill-Loras/wan2.1_i2v_lora_rank64_lightx2v_4step.safetensors \
+  --lora_scale 1.0 \
+  --dit_fsdp --t5_fsdp \
+  --ulysses_size 4 \
+  --size infinitetalk-480 \
+  --motion_frame 9 \
+  --sample_shift 7 \
+  --sample_text_guide_scale 5 \
+  --sample_audio_guide_scale 4 \
+  --host 0.0.0.0 --port 8000
+```
+
+对应的 client 请求把 `infer_steps` 改成 4：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a person is talking",
+    "image_path": "examples/single/ref_video.mp4",
+    "audio_path": "examples/single/1.wav",
+    "infer_steps": 4,
+    "target_video_length": 1000,
+    "seed": 42,
+    "size": "infinitetalk-480"
+  }'
+```
+
 ### 启动（pip 安装后直接运行）
 
 如果你希望“直接 pip 安装出 `infinitetalk.serving`”，可以在仓库根目录（`InfiniteTalk/`）执行：
