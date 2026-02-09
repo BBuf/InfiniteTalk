@@ -6,6 +6,8 @@ import sys
 import json
 import warnings
 from datetime import datetime
+import time
+from contextlib import contextmanager
 
 warnings.filterwarnings('ignore')
 
@@ -32,6 +34,68 @@ import numpy as np
 from einops import rearrange
 import soundfile as sf
 import re
+
+
+@contextmanager
+def _timed_stage(name: str, enabled: bool = True, stats: dict | None = None, key: str | None = None):
+    """
+    Print timing using print() (flush=True) to avoid being swallowed by logging.
+    """
+    if not enabled:
+        yield
+        return
+    t0 = time.perf_counter()
+    print(f"[TIMING] >> {name}", flush=True)
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        if stats is not None:
+            _timing_stats_add(stats, key or name, dt)
+        print(f"[TIMING] << {name}: {dt:.3f}s", flush=True)
+
+
+def _timing_enabled(args) -> bool:
+    # CLI flag first; then env var for convenience.
+    if getattr(args, "print_timing", False):
+        return True
+    v = os.getenv("INFINI_PRINT_TIMING", "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+def _timing_stats_add(stats: dict, key: str, dt: float) -> None:
+    item = stats.get(key)
+    if item is None:
+        stats[key] = {
+            "count": 1,
+            "total": float(dt),
+            "min": float(dt),
+            "max": float(dt),
+        }
+        return
+    item["count"] += 1
+    item["total"] += float(dt)
+    item["min"] = min(item["min"], float(dt))
+    item["max"] = max(item["max"], float(dt))
+
+
+def _print_timing_summary(stats: dict) -> None:
+    if not stats:
+        print("[TIMING] summary: (empty)", flush=True)
+        return
+    print("[TIMING] ===== summary (count/total/avg/min/max) =====", flush=True)
+    # Keep insertion order of dict (Py3.7+), so summary follows code order.
+    for k, v in stats.items():
+        cnt = int(v["count"])
+        total = float(v["total"])
+        avg = total / max(cnt, 1)
+        mn = float(v["min"])
+        mx = float(v["max"])
+        print(
+            f"[TIMING] {k:40s} | {cnt:4d} | {total:10.3f}s | {avg:9.3f}s | {mn:9.3f}s | {mx:9.3f}s",
+            flush=True,
+        )
+    print("[TIMING] ===== end summary =====", flush=True)
 
 
 def _validate_args(args):
@@ -267,6 +331,13 @@ def _parse_args():
         default=None,
         help="Quantization type, must be 'int8' or 'fp8'."
     )
+    parser.add_argument(
+        "--print_timing",
+        action="store_true",
+        default=False,
+        help="Print wall-clock timing for major stages (uses print + flush). "
+             "You can also set env INFINI_PRINT_TIMING=1."
+    )
     
     args = parser.parse_args()
 
@@ -456,25 +527,40 @@ def generate(args):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
     _init_logging(rank)
+    timing_on = _timing_enabled(args)
+    timing_stats = {} if (timing_on and rank == 0) else None
+
+    t_all0 = time.perf_counter()
+    if timing_on and rank == 0:
+        print(
+            f"[TIMING] start generate | pid={os.getpid()} | rank={rank} | world_size={world_size} | local_rank={local_rank}",
+            flush=True,
+        )
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
-    if world_size > 1:
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=rank,
-            world_size=world_size)
-    else:
-        assert not (
-            args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1 or args.ring_size > 1
-        ), f"context parallel are not supported in non-distributed environments."
+    with _timed_stage(
+        "distributed init / device setup",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="distributed init / device setup",
+    ):
+        if world_size > 1:
+            torch.cuda.set_device(local_rank)
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                rank=rank,
+                world_size=world_size)
+        else:
+            assert not (
+                args.t5_fsdp or args.dit_fsdp
+            ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
+            assert not (
+                args.ulysses_size > 1 or args.ring_size > 1
+            ), f"context parallel are not supported in non-distributed environments."
 
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
@@ -522,22 +608,28 @@ def generate(args):
     
 
     logging.info("Creating infinitetalk pipeline.")
-    wan_i2v = wan.InfiniteTalkPipeline(
-        config=cfg,
-        checkpoint_dir=args.ckpt_dir,
-        quant_dir=args.quant_dir,
-        device_id=device,
-        rank=rank,
-        t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp, 
-        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
-        t5_cpu=args.t5_cpu,
-        lora_dir=args.lora_dir,
-        lora_scales=args.lora_scale,
-        quant=args.quant,
-        dit_path=args.dit_path,
-        infinitetalk_dir=args.infinitetalk_dir
-    )
+    with _timed_stage(
+        "pipeline init (wan.InfiniteTalkPipeline)",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="pipeline init (wan.InfiniteTalkPipeline)",
+    ):
+        wan_i2v = wan.InfiniteTalkPipeline(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            quant_dir=args.quant_dir,
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp, 
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
+            t5_cpu=args.t5_cpu,
+            lora_dir=args.lora_dir,
+            lora_scales=args.lora_scale,
+            quant=args.quant,
+            dit_path=args.dit_path,
+            infinitetalk_dir=args.infinitetalk_dir
+        )
     if args.num_persistent_param_in_dit is not None:
         wan_i2v.vram_management = True
         wan_i2v.enable_vram_management(
@@ -545,49 +637,91 @@ def generate(args):
         )
     
     generated_list = []
-    with open(args.input_json, 'r', encoding='utf-8') as f:
-        input_data = json.load(f)
+    with _timed_stage(
+        "load input_json",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="load input_json",
+    ):
+        with open(args.input_json, 'r', encoding='utf-8') as f:
+            input_data = json.load(f)
         
-    wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
-    args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_video'].split('/')[-1].split('.')[0])
-    os.makedirs(args.audio_save_dir,exist_ok=True)
+    with _timed_stage(
+        "init wav2vec feature_extractor + encoder (cpu)",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="init wav2vec (cpu)",
+    ):
+        wav2vec_feature_extractor, audio_encoder = custom_init('cpu', args.wav2vec_dir)
+    with _timed_stage(
+        "prepare audio_save_dir",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="prepare audio_save_dir",
+    ):
+        args.audio_save_dir = os.path.join(
+            args.audio_save_dir,
+            input_data['cond_video'].split('/')[-1].split('.')[0]
+        )
+        os.makedirs(args.audio_save_dir, exist_ok=True)
     
     conds_list = []
 
-    if args.scene_seg and is_video(input_data['cond_video']):
-        time_list, cond_list = shot_detect(input_data['cond_video'], args.audio_save_dir)
-        if len(time_list)==0:
+    with _timed_stage(
+        "scene seg / build conds_list",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="scene seg / build conds_list",
+    ):
+        if args.scene_seg and is_video(input_data['cond_video']):
+            time_list, cond_list = shot_detect(input_data['cond_video'], args.audio_save_dir)
+            if len(time_list) == 0:
+                conds_list.append([input_data['cond_video']])
+                conds_list.append([input_data['cond_audio']['person1']])
+                if len(input_data['cond_audio']) == 2:
+                    conds_list.append([input_data['cond_audio']['person2']])
+            else:
+                audio1_list = split_wav_librosa(
+                    input_data['cond_audio']['person1'], time_list, args.audio_save_dir)
+                conds_list.append(cond_list)
+                conds_list.append(audio1_list)
+                if len(input_data['cond_audio']) == 2:
+                    audio2_list = split_wav_librosa(
+                        input_data['cond_audio']['person2'], time_list, args.audio_save_dir)
+                    conds_list.append(audio2_list)
+        else:
             conds_list.append([input_data['cond_video']])
             conds_list.append([input_data['cond_audio']['person1']])
-            if len(input_data['cond_audio'])==2:
+            if len(input_data['cond_audio']) == 2:
                 conds_list.append([input_data['cond_audio']['person2']])
-        else:
-            audio1_list = split_wav_librosa(input_data['cond_audio']['person1'], time_list, args.audio_save_dir)
-            conds_list.append(cond_list)
-            conds_list.append(audio1_list)
-            if len(input_data['cond_audio'])==2:
-                audio2_list = split_wav_librosa(input_data['cond_audio']['person2'], time_list, args.audio_save_dir)
-                conds_list.append(audio2_list)
-    else:
-        conds_list.append([input_data['cond_video']])
-        conds_list.append([input_data['cond_audio']['person1']])
-        if len(input_data['cond_audio'])==2:
-            conds_list.append([input_data['cond_audio']['person2']])
 
-    if len(input_data['cond_audio'])==2:
-        new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
-        sum_audio = os.path.join(args.audio_save_dir, 'sum_all.wav')
-        sf.write(sum_audio, sum_human_speechs, 16000)
-        input_data['video_audio'] = sum_audio
-    else:
-        human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
-        sum_audio = os.path.join(args.audio_save_dir, 'sum_all.wav')
-        sf.write(sum_audio, human_speech, 16000)
-        input_data['video_audio'] = sum_audio
+    with _timed_stage(
+        "prepare full video_audio (sum_all.wav)",
+        enabled=timing_on and rank == 0,
+        stats=timing_stats,
+        key="prepare full video_audio (sum_all.wav)",
+    ):
+        if len(input_data['cond_audio']) == 2:
+            new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(
+                input_data['cond_audio']['person1'],
+                input_data['cond_audio']['person2'],
+                input_data['audio_type']
+            )
+            sum_audio = os.path.join(args.audio_save_dir, 'sum_all.wav')
+            sf.write(sum_audio, sum_human_speechs, 16000)
+            input_data['video_audio'] = sum_audio
+        else:
+            human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
+            sum_audio = os.path.join(args.audio_save_dir, 'sum_all.wav')
+            sf.write(sum_audio, human_speech, 16000)
+            input_data['video_audio'] = sum_audio
     logging.info("Generating video ...")
         
     for idx, items in enumerate(zip(*conds_list)):
-        print(items)
+        if timing_on and rank == 0:
+            clip_t0 = time.perf_counter()
+            print(f"[TIMING] --- clip {idx} begin ---", flush=True)
+        print(items, flush=True)
         input_clip = {}
         input_clip['prompt'] = input_data['prompt']
         input_clip['cond_video'] = items[0]
@@ -599,49 +733,103 @@ def generate(args):
         cond_audio = {}
         if args.audio_mode=='localfile':
             if len(input_data['cond_audio'])==2:
-                new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(items[1], items[2], input_data['audio_type'])
-                audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
-                audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
-                emb1_path = os.path.join(args.audio_save_dir, '1.pt')
-                emb2_path = os.path.join(args.audio_save_dir, '2.pt')
-                sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-                sf.write(sum_audio, sum_human_speechs, 16000)
-                torch.save(audio_embedding_1, emb1_path)
-                torch.save(audio_embedding_2, emb2_path)
-                cond_audio['person1'] = emb1_path
-                cond_audio['person2'] = emb2_path
-                input_clip['video_audio'] = sum_audio
-                v_length = audio_embedding_1.shape[0]
+                with _timed_stage(
+                    f"clip {idx} audio_prepare_multi",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip audio_prepare_multi",
+                ):
+                    new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(
+                        items[1], items[2], input_data['audio_type'])
+                with _timed_stage(
+                    f"clip {idx} wav2vec embedding person1",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip wav2vec embedding person1",
+                ):
+                    audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+                with _timed_stage(
+                    f"clip {idx} wav2vec embedding person2",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip wav2vec embedding person2",
+                ):
+                    audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+                with _timed_stage(
+                    f"clip {idx} save embeddings + sum.wav",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip save embeddings + sum.wav (2p)",
+                ):
+                    emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+                    emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+                    sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+                    sf.write(sum_audio, sum_human_speechs, 16000)
+                    torch.save(audio_embedding_1, emb1_path)
+                    torch.save(audio_embedding_2, emb2_path)
+                    cond_audio['person1'] = emb1_path
+                    cond_audio['person2'] = emb2_path
+                    input_clip['video_audio'] = sum_audio
+                    v_length = audio_embedding_1.shape[0]
             elif len(input_data['cond_audio'])==1:
-                human_speech = audio_prepare_single(items[1])
-                audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
-                emb_path = os.path.join(args.audio_save_dir, '1.pt')
-                sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-                sf.write(sum_audio, human_speech, 16000)
-                torch.save(audio_embedding, emb_path)
-                cond_audio['person1'] = emb_path
-                input_clip['video_audio'] = sum_audio
-                v_length = audio_embedding.shape[0]
+                with _timed_stage(
+                    f"clip {idx} audio_prepare_single",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip audio_prepare_single",
+                ):
+                    human_speech = audio_prepare_single(items[1])
+                with _timed_stage(
+                    f"clip {idx} wav2vec embedding",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip wav2vec embedding (1p)",
+                ):
+                    audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
+                with _timed_stage(
+                    f"clip {idx} save embedding + sum.wav",
+                    enabled=timing_on and rank == 0,
+                    stats=timing_stats,
+                    key="clip save embeddings + sum.wav (1p)",
+                ):
+                    emb_path = os.path.join(args.audio_save_dir, '1.pt')
+                    sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+                    sf.write(sum_audio, human_speech, 16000)
+                    torch.save(audio_embedding, emb_path)
+                    cond_audio['person1'] = emb_path
+                    input_clip['video_audio'] = sum_audio
+                    v_length = audio_embedding.shape[0]
         
         input_clip['cond_audio'] = cond_audio
                     
-        video = wan_i2v.generate_infinitetalk(
-            input_clip,
-            size_buckget=args.size,
-            motion_frame=args.motion_frame,
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sampling_steps=args.sample_steps,
-            text_guide_scale=args.sample_text_guide_scale,
-            audio_guide_scale=args.sample_audio_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model,
-            max_frames_num=args.frame_num if args.mode == 'clip' else args.max_frame_num,
-            color_correction_strength = args.color_correction_strength,
-            extra_args=args,
+        with _timed_stage(
+            f"clip {idx} model generate_infinitetalk",
+            enabled=timing_on and rank == 0,
+            stats=timing_stats,
+            key="clip model generate_infinitetalk",
+        ):
+            video = wan_i2v.generate_infinitetalk(
+                input_clip,
+                size_buckget=args.size,
+                motion_frame=args.motion_frame,
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sampling_steps=args.sample_steps,
+                text_guide_scale=args.sample_text_guide_scale,
+                audio_guide_scale=args.sample_audio_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model,
+                max_frames_num=args.frame_num if args.mode == 'clip' else args.max_frame_num,
+                color_correction_strength=args.color_correction_strength,
+                extra_args=args,
             )
         
         generated_list.append(video)
+        if timing_on and rank == 0:
+            clip_dt = time.perf_counter() - clip_t0
+            if timing_stats is not None:
+                _timing_stats_add(timing_stats, "clip total", clip_dt)
+            print(f"[TIMING] --- clip {idx} end ---", flush=True)
 
     if rank == 0:
         
@@ -651,11 +839,30 @@ def generate(args):
                                                                         "_")[:50]
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
         
-        sum_video = torch.cat(generated_list, dim=1)
-        save_video_ffmpeg(sum_video, args.save_file, [input_data['video_audio']], high_quality_save=False)
+        with _timed_stage(
+            "postprocess: torch.cat videos",
+            enabled=timing_on and rank == 0,
+            stats=timing_stats,
+            key="postprocess: torch.cat videos",
+        ):
+            sum_video = torch.cat(generated_list, dim=1)
+        with _timed_stage(
+            "postprocess: save_video_ffmpeg",
+            enabled=timing_on and rank == 0,
+            stats=timing_stats,
+            key="postprocess: save_video_ffmpeg",
+        ):
+            save_video_ffmpeg(
+                sum_video, args.save_file, [input_data['video_audio']], high_quality_save=False)
    
     logging.info(f"Saving generated video to {args.save_file}.mp4")  
     logging.info("Finished.")
+    if timing_on and rank == 0:
+        dt_all = time.perf_counter() - t_all0
+        if timing_stats is not None:
+            _timing_stats_add(timing_stats, "total generate()", dt_all)
+        print(f"[TIMING] total generate(): {dt_all:.3f}s", flush=True)
+        _print_timing_summary(timing_stats or {})
 
 
 if __name__ == "__main__":
