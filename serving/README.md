@@ -145,6 +145,32 @@ torchrun --nproc_per_node=4 infinitetalk-serving \
 }
 ```
 
+#### TeaCache（可选）
+
+你可以在**启动服务时**开启 TeaCache（作为默认值）：
+
+```bash
+torchrun --nproc_per_node=4 -m infinitetalk.serving ... --use_teacache --teacache_thresh 0.2
+```
+
+也可以在**单次请求**里覆盖（适合做 A/B 对比）：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a person is talking",
+    "image_path": "examples/single/ref_video.mp4",
+    "audio_path": "examples/single/1.wav",
+    "infer_steps": 8,
+    "target_video_length": 1000,
+    "seed": 42,
+    "size": "infinitetalk-480",
+    "use_teacache": true,
+    "teacache_thresh": 0.2
+  }'
+```
+
 ### Client 访问方式（i2v / v2v）
 
 下面示例默认服务在 `http://127.0.0.1:8000`。

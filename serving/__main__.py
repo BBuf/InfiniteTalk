@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--sample_audio_guide_scale", type=float, default=4.0, help="Audio CFG scale")
     parser.add_argument("--offload_model", action="store_true", help="Enable CPU offload between forwards")
     parser.add_argument("--max_frame_num", type=int, default=1000, help="Default max frames in streaming mode")
+    parser.add_argument("--use_teacache", action="store_true", default=False, help="Enable TeaCache by default")
+    parser.add_argument("--teacache_thresh", type=float, default=0.2, help="TeaCache threshold (default: 0.2)")
 
     # Dist / VRAM
     parser.add_argument("--t5_fsdp", action="store_true", default=False)
