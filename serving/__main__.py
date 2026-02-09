@@ -34,6 +34,13 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port", type=int, default=8000, help="Server port")
     parser.add_argument("--max_queue_size", type=int, default=10, help="Max pending+running tasks")
+    parser.add_argument(
+        "--print_timing",
+        action="store_true",
+        default=False,
+        help="Print wall-clock timing for major stages (uses print + flush). "
+        "Also enabled by env INFINI_PRINT_TIMING=1",
+    )
 
     # Defaults for generation (can be overridden per request with optional fields)
     parser.add_argument("--size", type=str, default="infinitetalk-480", help="infinitetalk-480 or infinitetalk-720")
