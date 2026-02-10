@@ -58,11 +58,25 @@ need_file "${REF_IMAGE}" "REF_IMAGE"
 json_get() {
   local key="$1"
   python3 - "$key" <<'PY'
-import json,sys
-key=sys.argv[1]
-data=json.load(sys.stdin)
-val=data.get(key)
+import json, sys
+
+key = sys.argv[1]
+raw = sys.stdin.read()
+if not raw.strip():
+  print(f"[ERROR] empty response body while extracting key={key}", file=sys.stderr)
+  raise SystemExit(3)
+try:
+  data = json.loads(raw)
+except Exception as e:
+  print(f"[ERROR] response is not valid JSON while extracting key={key}: {e}", file=sys.stderr)
+  print("[ERROR] raw response:", file=sys.stderr)
+  print(raw, file=sys.stderr)
+  raise SystemExit(3)
+
+val = data.get(key)
 if val is None:
+  print(f"[ERROR] JSON key not found: {key}", file=sys.stderr)
+  print(json.dumps(data, ensure_ascii=False, indent=2), file=sys.stderr)
   raise SystemExit(3)
 print(val)
 PY
@@ -88,7 +102,7 @@ payload = {
   "prompt": os.environ.get("PROMPT", "a person is talking"),
   "image_path": cond_path,
   "audio_path": audio_path,
-  "infer_steps": int(os.environ.get("INFER_STEPS", "8")),
+  "infer_steps": int(os.environ.get("INFER_STEPS", "40")),
   "target_video_length": int(os.environ.get("TARGET_VIDEO_LENGTH", "1000")),
   "seed": int(os.environ.get("SEED", "42")),
   "size": size,
@@ -101,12 +115,38 @@ print(json.dumps(payload, ensure_ascii=False))
 PY
   )"
 
-  echo "[INFO] Create task: ${tag}"
-  local resp
-  resp="$(curl -sS -X POST "${BASE_URL}/v1/tasks/video" -H "Content-Type: application/json" -d "${payload}")"
+  echo "[INFO] Create task: ${tag}" >&2
+
+  # Capture body + HTTP status code (last line).
+  local raw
+  raw="$(curl -sS -X POST "${BASE_URL}/v1/tasks/video" \
+    -H "Content-Type: application/json" \
+    -d "${payload}" \
+    -w $'\n%{http_code}')"
+
+  local http_code body
+  http_code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+
+  if [[ -z "${http_code}" || "${http_code}" == "${raw}" ]]; then
+    echo "[ERROR] Failed to parse HTTP code from response." >&2
+    echo "[ERROR] Raw response:" >&2
+    echo "${raw}" >&2
+    exit 3
+  fi
+
+  if [[ "${http_code}" != "200" ]]; then
+    echo "[ERROR] Create task failed: HTTP ${http_code}" >&2
+    echo "[ERROR] Response body:" >&2
+    echo "${body}" >&2
+    exit 3
+  fi
+
   local task_id
-  task_id="$(printf '%s' "${resp}" | json_get "task_id")"
-  echo "[INFO]   task_id=${task_id}"
+  task_id="$(json_get "task_id" <<<"${body}")"
+  echo "[INFO]   task_id=${task_id}" >&2
+
+  # IMPORTANT: only echo task_id to stdout (so command substitution stays clean).
   echo "${task_id}"
 }
 
@@ -117,10 +157,19 @@ poll_and_download() {
 
   echo "[INFO] Polling: ${tag} (${task_id})"
   while true; do
-    local status_json
-    status_json="$(curl -sS "${BASE_URL}/v1/tasks/${task_id}/status")"
-    local st
-    st="$(printf '%s' "${status_json}" | json_get "status")"
+    local raw http_code status_json st
+    raw="$(curl -sS "${BASE_URL}/v1/tasks/${task_id}/status" -w $'\n%{http_code}')"
+    http_code="${raw##*$'\n'}"
+    status_json="${raw%$'\n'*}"
+
+    if [[ "${http_code}" != "200" ]]; then
+      echo "[ERROR] Poll status failed for ${task_id}: HTTP ${http_code}" >&2
+      echo "[ERROR] Response body:" >&2
+      echo "${status_json}" >&2
+      return 4
+    fi
+
+    st="$(json_get "status" <<<"${status_json}")"
     if [[ "${st}" == "completed" ]]; then
       echo "[INFO]   completed."
       break
