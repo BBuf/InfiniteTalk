@@ -46,4 +46,6 @@ torchrun --nproc_per_node="${NPROC}" -m infinitetalk.serving \
   --sample_text_guide_scale "${TEXT_GUIDE_DEFAULT}" \
   --sample_audio_guide_scale "${AUDIO_GUIDE_DEFAULT}" \
   --use_teacache --teacache_thresh "${TEACACHE_THRESH}" \
-  --host "${HOST}" --port "${PORT}"
+  --host "${HOST}" --port "${PORT}" \
+  --print_timing
+
