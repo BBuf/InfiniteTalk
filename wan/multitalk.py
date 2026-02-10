@@ -36,10 +36,20 @@ from wan.wan_lora import WanLoraWrapper
 from safetensors.torch import load_file
 from optimum.quanto import quantize, freeze, qint8,requantize
 import optimum.quanto.nn.qlinear as qlinear
+from .utils.timing import timed, timing_enabled
 
 def torch_gc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    # NOTE: torch_gc() can be surprisingly expensive (and may dominate non-forward time).
+    # Aggregate its cost into global timing stats when enabled.
+    with timed(
+        "torch_gc",
+        key="runtime/torch_gc",
+        log=False,
+        sync_cuda=False,
+        rank0_only=True,
+    ):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 def to_param_dtype_fp32only(model, param_dtype):
     for module in model.modules():
@@ -164,92 +174,155 @@ class InfiniteTalkPipeline:
 
         shard_fn = partial(shard_model, device_id=device_id)
 
-        logging.info("[InfiniteTalkPipeline] [1/5] Loading T5 text encoder ...")
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None,
-            quant=quant,
-            quant_dir=os.path.dirname(quant_dir) if quant_dir is not None else None,
-        )
-        logging.info("[InfiniteTalkPipeline] [1/5] T5 loaded.")
+        with timed(
+            "[InfiniteTalkPipeline] load T5 text encoder",
+            key="pipeline.init/load T5",
+            log=True,
+            rank0_only=True,
+        ):
+            logging.info("[InfiniteTalkPipeline] [1/5] Loading T5 text encoder ...")
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None,
+                quant=quant,
+                quant_dir=os.path.dirname(quant_dir) if quant_dir is not None else None,
+            )
+            logging.info("[InfiniteTalkPipeline] [1/5] T5 loaded.")
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
-        logging.info("[InfiniteTalkPipeline] [2/5] Loading VAE ...")
-        self.vae = WanVAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
-        logging.info("[InfiniteTalkPipeline] [2/5] VAE loaded.")
+        with timed(
+            "[InfiniteTalkPipeline] load VAE",
+            key="pipeline.init/load VAE",
+            log=True,
+            rank0_only=True,
+        ):
+            logging.info("[InfiniteTalkPipeline] [2/5] Loading VAE ...")
+            self.vae = WanVAE(
+                vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                device=self.device,
+            )
+            logging.info("[InfiniteTalkPipeline] [2/5] VAE loaded.")
 
-        logging.info("[InfiniteTalkPipeline] [3/5] Loading CLIP ...")
-        self.clip = CLIPModel(
-            dtype=config.clip_dtype,
-            device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir,
-                                         config.clip_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
-        logging.info("[InfiniteTalkPipeline] [3/5] CLIP loaded.")
+        with timed(
+            "[InfiniteTalkPipeline] load CLIP",
+            key="pipeline.init/load CLIP",
+            log=True,
+            rank0_only=True,
+        ):
+            logging.info("[InfiniteTalkPipeline] [3/5] Loading CLIP ...")
+            self.clip = CLIPModel(
+                dtype=config.clip_dtype,
+                device=self.device,
+                checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer),
+            )
+            logging.info("[InfiniteTalkPipeline] [3/5] CLIP loaded.")
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
         if quant is not None:
-            logging.info(f"Loading Quantized MultiTalk from {quant_dir}")
-            with torch.device('meta'):
-                wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
-                self.model = WanModel(weight_init=False,**wan_config)
-                torch_gc()
-            model_state_dict = load_file(quant_dir)
-            map_json_path = os.path.join(quant_dir.replace('safetensors', 'json'))
-            self.model.init_freqs()
-            with open(map_json_path, "r") as f:
-                quantization_map = json.load(f)
-            requantize(self.model, model_state_dict, quantization_map, device='cpu')
+            with timed(
+                "[InfiniteTalkPipeline] load quantized WanModel",
+                key="pipeline.init/load quantized model",
+                log=True,
+                rank0_only=True,
+            ):
+                logging.info(f"Loading Quantized MultiTalk from {quant_dir}")
+                with torch.device('meta'):
+                    wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
+                    self.model = WanModel(weight_init=False, **wan_config)
+                    torch_gc()
+                model_state_dict = load_file(quant_dir)
+                map_json_path = os.path.join(quant_dir.replace('safetensors', 'json'))
+                self.model.init_freqs()
+                with open(map_json_path, "r") as f:
+                    quantization_map = json.load(f)
+                requantize(self.model, model_state_dict, quantization_map, device='cpu')
         else:
             if dit_path is None:
-                init_contexts = [no_init_weights()]
-                init_contexts.append(accelerate.init_empty_weights())
-                wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
-                self.model = WanModel(weight_init=False,**wan_config).to(dtype=self.param_dtype)
-                weight_files = [f"{checkpoint_dir}/diffusion_pytorch_model-00001-of-00007.safetensors", 
-                                f"{checkpoint_dir}/diffusion_pytorch_model-00002-of-00007.safetensors", 
-                                f"{checkpoint_dir}/diffusion_pytorch_model-00003-of-00007.safetensors", 
-                                f"{checkpoint_dir}/diffusion_pytorch_model-00004-of-00007.safetensors",
-                                f"{checkpoint_dir}/diffusion_pytorch_model-00005-of-00007.safetensors", 
-                                f"{checkpoint_dir}/diffusion_pytorch_model-00006-of-00007.safetensors", 
-                                f"{checkpoint_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
-                                f"{infinitetalk_dir}"]
-                merged_state_dict = {}
-                logging.info(f"[InfiniteTalkPipeline] [4/5] Loading diffusion weights ({len(weight_files)} files) ...")
-                for idx, weight_file in enumerate(weight_files, start=1):
-                    logging.info(f"[InfiniteTalkPipeline]   - loading {idx}/{len(weight_files)}: {os.path.basename(weight_file)}")
-                    sd = load_file(weight_file)
-                    merged_state_dict.update(sd)
-                logging.info("[InfiniteTalkPipeline] [4/5] All weights loaded, applying state_dict ...")
-                self.model.load_state_dict(merged_state_dict)
-                logging.info("[InfiniteTalkPipeline] [4/5] state_dict applied.")
+                with timed(
+                    "[InfiniteTalkPipeline] init WanModel + load weights",
+                    key="pipeline.init/init model + load weights",
+                    log=True,
+                    rank0_only=True,
+                ):
+                    init_contexts = [no_init_weights()]
+                    init_contexts.append(accelerate.init_empty_weights())
+                    wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
+                    self.model = WanModel(weight_init=False, **wan_config).to(dtype=self.param_dtype)
+                    weight_files = [
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00001-of-00007.safetensors",
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00002-of-00007.safetensors",
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00003-of-00007.safetensors",
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00004-of-00007.safetensors",
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00005-of-00007.safetensors",
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00006-of-00007.safetensors",
+                        f"{checkpoint_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
+                        f"{infinitetalk_dir}",
+                    ]
+                    merged_state_dict = {}
+                    logging.info(
+                        f"[InfiniteTalkPipeline] [4/5] Loading diffusion weights ({len(weight_files)} files) ..."
+                    )
+                    for idx, weight_file in enumerate(weight_files, start=1):
+                        with timed(
+                            f"[InfiniteTalkPipeline] load weights file {idx}/{len(weight_files)}",
+                            key="pipeline.init/load weights file",
+                            log=False,  # avoid per-file spam; aggregated only
+                            rank0_only=True,
+                        ):
+                            logging.info(
+                                f"[InfiniteTalkPipeline]   - loading {idx}/{len(weight_files)}: {os.path.basename(weight_file)}"
+                            )
+                            sd = load_file(weight_file)
+                            merged_state_dict.update(sd)
+                    with timed(
+                        "[InfiniteTalkPipeline] apply merged state_dict",
+                        key="pipeline.init/apply state_dict",
+                        log=True,
+                        rank0_only=True,
+                    ):
+                        logging.info("[InfiniteTalkPipeline] [4/5] All weights loaded, applying state_dict ...")
+                        self.model.load_state_dict(merged_state_dict)
+                        logging.info("[InfiniteTalkPipeline] [4/5] state_dict applied.")
                 
             else:
-                init_contexts = [no_init_weights()]
-                init_contexts.append(accelerate.init_empty_weights())
-                with ContextManagers(init_contexts):
-                    wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
-                    self.model = WanModel(weight_init=False,**wan_config)
-                checkpoint_weights = torch.load(dit_path, map_location='cpu')
-                self.model.load_state_dict(checkpoint_weights['state_dict'])
-                logging.info(f"loading infinitetalk weights {checkpoint_dir}")
+                with timed(
+                    "[InfiniteTalkPipeline] init WanModel from dit_path",
+                    key="pipeline.init/init model from dit_path",
+                    log=True,
+                    rank0_only=True,
+                ):
+                    init_contexts = [no_init_weights()]
+                    init_contexts.append(accelerate.init_empty_weights())
+                    with ContextManagers(init_contexts):
+                        wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
+                        self.model = WanModel(weight_init=False, **wan_config)
+                    checkpoint_weights = torch.load(dit_path, map_location='cpu')
+                    self.model.load_state_dict(checkpoint_weights['state_dict'])
+                    logging.info(f"loading infinitetalk weights {checkpoint_dir}")
             
         self.model.eval().requires_grad_(False)
         
         to_param_dtype_fp32only(self.model, self.param_dtype)
         if lora_dir is not None and quant is None :
-            lora_wrapper = WanLoraWrapper(self.model)
-            for lora_path, lora_scale in zip(lora_dir, lora_scales):
-                lora_name = lora_wrapper.load_lora(lora_path)
-                lora_wrapper.apply_lora(lora_name, lora_scale, param_dtype=self.param_dtype, device=self.device)
+            with timed(
+                "[InfiniteTalkPipeline] load/apply LoRA",
+                key="pipeline.init/lora",
+                log=True,
+                rank0_only=True,
+            ):
+                lora_wrapper = WanLoraWrapper(self.model)
+                for lora_path, lora_scale in zip(lora_dir, lora_scales):
+                    lora_name = lora_wrapper.load_lora(lora_path)
+                    lora_wrapper.apply_lora(
+                        lora_name, lora_scale, param_dtype=self.param_dtype, device=self.device
+                    )
 
 
     
@@ -279,10 +352,22 @@ class InfiniteTalkPipeline:
         if dist.is_initialized():
             dist.barrier()
         if dit_fsdp:
-            self.model = shard_fn(self.model)
+            with timed(
+                "[InfiniteTalkPipeline] shard DiT with FSDP",
+                key="pipeline.init/fsdp shard",
+                log=True,
+                rank0_only=True,
+            ):
+                self.model = shard_fn(self.model)
         else:
             if not init_on_cpu:
-                self.model.to(self.device)
+                with timed(
+                    "[InfiniteTalkPipeline] move DiT to device",
+                    key="pipeline.init/model.to(device)",
+                    log=True,
+                    rank0_only=True,
+                ):
+                    self.model.to(self.device)
         
         self.sample_neg_prompt = config.sample_neg_prompt
         self.num_timesteps = num_timesteps
@@ -342,44 +427,50 @@ class InfiniteTalkPipeline:
         self.cpu_offload = True
     
     def load_models_to_device(self, loadmodel_names=[]):
-        # only load models to device if cpu_offload is enabled
-        if not self.cpu_offload:
-            return
-        # offload the unneeded models to cpu
-        for model_name in self.model_names:
-            if model_name not in loadmodel_names:
-                model = getattr(self, model_name)
+        with timed(
+            "load_models_to_device",
+            key="runtime/cpu_offload/load_models_to_device",
+            log=False,
+            rank0_only=True,
+        ):
+            # only load models to device if cpu_offload is enabled
+            if not self.cpu_offload:
+                return
+            # offload the unneeded models to cpu
+            for model_name in self.model_names:
+                if model_name not in loadmodel_names:
+                    model = getattr(self, model_name)
 
+                    if not isinstance(model, nn.Module):
+                        model = model.model
+
+                    if model is not None:
+                        if (
+                            hasattr(model, "vram_management_enabled")
+                            and model.vram_management_enabled
+                        ):
+                            for module in model.modules():
+                                if hasattr(module, "offload"):
+                                    module.offload()
+                        else:
+                            model.cpu()
+            # load the needed models to device
+            for model_name in loadmodel_names:
+                model = getattr(self, model_name)
                 if not isinstance(model, nn.Module):
                     model = model.model
-
                 if model is not None:
                     if (
                         hasattr(model, "vram_management_enabled")
                         and model.vram_management_enabled
                     ):
                         for module in model.modules():
-                            if hasattr(module, "offload"):
-                                module.offload()
+                            if hasattr(module, "onload"):
+                                module.onload()
                     else:
-                        model.cpu()
-        # load the needed models to device
-        for model_name in loadmodel_names:
-            model = getattr(self, model_name)
-            if not isinstance(model, nn.Module):
-                model = model.model
-            if model is not None:
-                if (
-                    hasattr(model, "vram_management_enabled")
-                    and model.vram_management_enabled
-                ):
-                    for module in model.modules():
-                        if hasattr(module, "onload"):
-                            module.onload()
-                else:
-                    model.to(self.device)
-        # fresh the cuda cache
-        torch.cuda.empty_cache()
+                        model.to(self.device)
+            # fresh the cuda cache
+            torch.cuda.empty_cache()
 
    
     def generate_infinitetalk(self,
@@ -428,36 +519,56 @@ class InfiniteTalkPipeline:
         else:
             self.model.disable_teacache()
 
+        timing_on = timing_enabled(extra_args)
+        if timing_on:
+            # For non-generate entrypoints, still allow env-based enablement downstream.
+            os.environ["INFINI_PRINT_TIMING"] = "1"
+        _tp = "pipeline.generate_infinitetalk/"
+
         input_prompt = input_data['prompt']
         cond_file_path = input_data['cond_video']
-        codec = get_video_codec(cond_file_path)
-        if codec == 'av1':
-            output_video_path = 'tmp/' + '_input_h264.mp4'
-            print(f"Converting {cond_file_path} from AV1 to H.264...")
-            convert_video_to_h264(cond_file_path, output_video_path)
-            print(f"Conversion complete! Saved as {output_video_path}")
-            cond_file_path = output_video_path
-        else:
-            print("No conversion needed.")
-        cond_image = extract_specific_frames(cond_file_path, 0)
+        with timed(
+            "preprocess: codec check/convert + extract first frame",
+            enabled=timing_on,
+            key=_tp + "preprocess/codec+first_frame",
+            log=True,
+            rank0_only=True,
+        ):
+            codec = get_video_codec(cond_file_path)
+            if codec == 'av1':
+                output_video_path = 'tmp/' + '_input_h264.mp4'
+                print(f"Converting {cond_file_path} from AV1 to H.264...")
+                convert_video_to_h264(cond_file_path, output_video_path)
+                print(f"Conversion complete! Saved as {output_video_path}")
+                cond_file_path = output_video_path
+            else:
+                print("No conversion needed.")
+            cond_image = extract_specific_frames(cond_file_path, 0)
         # cond_image = Image.fromarray(cond_image)
         
         
         # decide a proper size
-        bucket_config_module = importlib.import_module("wan.utils.multitalk_utils")
-        if size_buckget == 'infinitetalk-480':
-            bucket_config = getattr(bucket_config_module, 'ASPECT_RATIO_627')
-        elif size_buckget == 'infinitetalk-720':
-            bucket_config = getattr(bucket_config_module, 'ASPECT_RATIO_960')
+        with timed(
+            "preprocess: choose bucket + resize/normalize",
+            enabled=timing_on,
+            key=_tp + "preprocess/bucket+resize",
+            log=True,
+            rank0_only=True,
+        ):
+            bucket_config_module = importlib.import_module("wan.utils.multitalk_utils")
+            if size_buckget == 'infinitetalk-480':
+                bucket_config = getattr(bucket_config_module, 'ASPECT_RATIO_627')
+            elif size_buckget == 'infinitetalk-720':
+                bucket_config = getattr(bucket_config_module, 'ASPECT_RATIO_960')
 
-        src_h, src_w = cond_image.height, cond_image.width
-        ratio = src_h / src_w
-        closest_bucket = sorted(list(bucket_config.keys()), key=lambda x: abs(float(x)-ratio))[0]
-        target_h, target_w = bucket_config[closest_bucket][0]
-        cond_image = resize_and_centercrop(cond_image, (target_h, target_w))
-        cond_image = cond_image / 255
-        cond_image = (cond_image - 0.5) * 2 # normalization
-        cond_image = cond_image.to(self.device)  # 1 C 1 H W
+            src_h, src_w = cond_image.height, cond_image.width
+            ratio = src_h / src_w
+            closest_bucket = sorted(list(bucket_config.keys()), key=lambda x: abs(float(x)-ratio))[0]
+            target_h, target_w = bucket_config[closest_bucket][0]
+            cond_image = resize_and_centercrop(cond_image, (target_h, target_w))
+            cond_image = cond_image / 255
+            cond_image = (cond_image - 0.5) * 2 # normalization
+            cond_image = cond_image.to(self.device)  # 1 C 1 H W
 
         # Store the original image for color reference if strength > 0
         original_color_reference = None
@@ -475,34 +586,48 @@ class InfiniteTalkPipeline:
             audio_embedding_path_2 = input_data['cond_audio']['person2']
 
         
-        full_audio_embs = []        
-        audio_embedding_paths = [audio_embedding_path_1, audio_embedding_path_2]
-        for human_idx in range(HUMAN_NUMBER):   
-            audio_embedding_path = audio_embedding_paths[human_idx]
-            if not os.path.exists(audio_embedding_path):
-                continue
-            full_audio_emb = torch.load(audio_embedding_path)
-            if torch.isnan(full_audio_emb).any():
-                continue
-            if full_audio_emb.shape[0] <= frame_num:
-                continue
-            full_audio_embs.append(full_audio_emb) 
+        with timed(
+            "load audio embeddings (torch.load .pt)",
+            enabled=timing_on,
+            key=_tp + "io/load_audio_embeddings",
+            log=True,
+            rank0_only=True,
+        ):
+            full_audio_embs = []        
+            audio_embedding_paths = [audio_embedding_path_1, audio_embedding_path_2]
+            for human_idx in range(HUMAN_NUMBER):   
+                audio_embedding_path = audio_embedding_paths[human_idx]
+                if not os.path.exists(audio_embedding_path):
+                    continue
+                full_audio_emb = torch.load(audio_embedding_path)
+                if torch.isnan(full_audio_emb).any():
+                    continue
+                if full_audio_emb.shape[0] <= frame_num:
+                    continue
+                full_audio_embs.append(full_audio_emb) 
         
         assert len(full_audio_embs) == HUMAN_NUMBER, f"Aduio file not exists or length not satisfies frame nums."
 
         # preprocess text embedding
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context, context_null = self.text_encoder([input_prompt, n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+        with timed(
+            "text encode (T5)",
+            enabled=timing_on,
+            key=_tp + "text/t5_encode",
+            log=True,
+            rank0_only=True,
+        ):
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context, context_null = self.text_encoder([input_prompt, n_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
 
         torch_gc()
         # prepare params for video generation
@@ -526,21 +651,28 @@ class InfiniteTalkPipeline:
 
         # start video generation iteratively
         while True:
-            audio_embs = []
-            # split audio with window size
-            for human_idx in range(HUMAN_NUMBER):   
-                center_indices = torch.arange(
-                    audio_start_idx,
-                    audio_end_idx,
-                    1,
-                ).unsqueeze(
-                    1
-                ) + indices.unsqueeze(0)
-                center_indices = torch.clamp(center_indices, min=0, max=full_audio_embs[human_idx].shape[0]-1)
-                audio_emb = full_audio_embs[human_idx][center_indices][None,...].to(self.device)
-                audio_embs.append(audio_emb)
-            audio_embs = torch.concat(audio_embs, dim=0).to(self.param_dtype)
-            torch_gc()
+            with timed(
+                "iter: slice audio embeddings window + to(device)",
+                enabled=timing_on,
+                key=_tp + "iter/audio_window",
+                log=False,
+                rank0_only=True,
+            ):
+                audio_embs = []
+                # split audio with window size
+                for human_idx in range(HUMAN_NUMBER):   
+                    center_indices = torch.arange(
+                        audio_start_idx,
+                        audio_end_idx,
+                        1,
+                    ).unsqueeze(
+                        1
+                    ) + indices.unsqueeze(0)
+                    center_indices = torch.clamp(center_indices, min=0, max=full_audio_embs[human_idx].shape[0]-1)
+                    audio_emb = full_audio_embs[human_idx][center_indices][None,...].to(self.device)
+                    audio_embs.append(audio_emb)
+                audio_embs = torch.concat(audio_embs, dim=0).to(self.param_dtype)
+                torch_gc()
 
             h, w = cond_image.shape[-2], cond_image.shape[-1]
             lat_h, lat_w = h // self.vae_stride[1], w // self.vae_stride[2]
@@ -569,23 +701,44 @@ class InfiniteTalkPipeline:
 
             with torch.no_grad():
                 # get clip embedding
-                self.clip.model.to(self.device)
-                clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype) 
-                if offload_model:
-                    self.clip.model.cpu()
-                torch_gc()
+                with timed(
+                    "clip visual forward",
+                    enabled=timing_on,
+                    key=_tp + "clip/visual_forward",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    self.clip.model.to(self.device)
+                    clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype) 
+                    if offload_model:
+                        self.clip.model.cpu()
+                    torch_gc()
 
                 # zero padding and vae encode
-                video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
-                padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
-                y = self.vae.encode(padding_frames_pixels_values) 
-                y = torch.stack(y).to(self.param_dtype) # B C T H W
-                cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
+                with timed(
+                    "vae encode (padding frames)",
+                    enabled=timing_on,
+                    key=_tp + "vae/encode_padding",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
+                    padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
+                    y = self.vae.encode(padding_frames_pixels_values) 
+                    y = torch.stack(y).to(self.param_dtype) # B C T H W
+                    cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
 
-                if is_first_clip:
-                    latent_motion_frames = self.vae.encode(cond_image)[0]
-                else:
-                    latent_motion_frames = self.vae.encode(cond_frame)[0]
+                with timed(
+                    "vae encode (motion frames)",
+                    enabled=timing_on,
+                    key=_tp + "vae/encode_motion",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    if is_first_clip:
+                        latent_motion_frames = self.vae.encode(cond_image)[0]
+                    else:
+                        latent_motion_frames = self.vae.encode(cond_frame)[0]
 
                 y = torch.concat([msk, y], dim=1) # B 4+C T H W
                 torch_gc()
@@ -645,11 +798,18 @@ class InfiniteTalkPipeline:
             with torch.no_grad(), no_sync():
                 
                 # prepare timesteps
-                timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
-                timesteps.append(0.)
-                timesteps = [torch.tensor([t], device=self.device) for t in timesteps]
-                if self.use_timestep_transform:
-                    timesteps = [timestep_transform(t, shift=shift, num_timesteps=self.num_timesteps) for t in timesteps]
+                with timed(
+                    "prepare timesteps",
+                    enabled=timing_on,
+                    key=_tp + "sampling/prepare_timesteps",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
+                    timesteps.append(0.)
+                    timesteps = [torch.tensor([t], device=self.device) for t in timesteps]
+                    if self.use_timestep_transform:
+                        timesteps = [timestep_transform(t, shift=shift, num_timesteps=self.num_timesteps) for t in timesteps]
                 
                 # sample videos
                 latent = noise
@@ -721,20 +881,48 @@ class InfiniteTalkPipeline:
                     latent_model_input = [latent.to(self.device)]
 
                     # inference with CFG strategy
-                    noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0] 
+                    with timed(
+                        "dit forward: cond",
+                        enabled=timing_on,
+                        key=_tp + "forward/cond",
+                        log=False,
+                        rank0_only=True,
+                    ):
+                        noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0] 
                     torch_gc()
 
                     if math.isclose(text_guide_scale, 1.0):
-                        noise_pred_drop_audio = self.model(
-                            latent_model_input, t=timestep, **arg_null_audio)[0]  
+                        with timed(
+                            "dit forward: drop_audio",
+                            enabled=timing_on,
+                            key=_tp + "forward/drop_audio",
+                            log=False,
+                            rank0_only=True,
+                        ):
+                            noise_pred_drop_audio = self.model(
+                                latent_model_input, t=timestep, **arg_null_audio)[0]  
                         torch_gc()
                     else:
-                        noise_pred_drop_text = self.model(
-                            latent_model_input, t=timestep, **arg_null_text)[0] 
+                        with timed(
+                            "dit forward: drop_text",
+                            enabled=timing_on,
+                            key=_tp + "forward/drop_text",
+                            log=False,
+                            rank0_only=True,
+                        ):
+                            noise_pred_drop_text = self.model(
+                                latent_model_input, t=timestep, **arg_null_text)[0] 
                         torch_gc()
-                        noise_pred_uncond = self.model(
-                            latent_model_input, t=timestep, **arg_null)[0]  
+                        with timed(
+                            "dit forward: uncond",
+                            enabled=timing_on,
+                            key=_tp + "forward/uncond",
+                            log=False,
+                            rank0_only=True,
+                        ):
+                            noise_pred_uncond = self.model(
+                                latent_model_input, t=timestep, **arg_null)[0]  
                         torch_gc()
 
                     if extra_args.use_apg:
@@ -788,13 +976,27 @@ class InfiniteTalkPipeline:
                         self.model.cpu()
                 torch_gc()
 
-                videos = self.vae.decode(x0)
+                with timed(
+                    "vae decode",
+                    enabled=timing_on,
+                    key=_tp + "vae/decode",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    videos = self.vae.decode(x0)
             
             # cache generated samples
             videos = torch.stack(videos).cpu() # B C T H W
             # >>> START OF COLOR CORRECTION STEP <<<
             if color_correction_strength > 0.0 and original_color_reference is not None:
-                videos = match_and_blend_colors(videos, original_color_reference, color_correction_strength)
+                with timed(
+                    "color correction",
+                    enabled=timing_on,
+                    key=_tp + "post/color_correction",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    videos = match_and_blend_colors(videos, original_color_reference, color_correction_strength)
             # >>> END OF COLOR CORRECTION STEP <<<
 
             if is_first_clip:
@@ -843,7 +1045,14 @@ class InfiniteTalkPipeline:
             if offload_model:    
                 torch.cuda.synchronize()
             if dist.is_initialized():
-                dist.barrier()
+                with timed(
+                    "dist.barrier (per-iter end)",
+                    enabled=timing_on,
+                    key=_tp + "dist/barrier_iter_end",
+                    log=False,
+                    rank0_only=True,
+                ):
+                    dist.barrier()
         
         gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
         gen_video_samples = gen_video_samples.to(torch.float32)
@@ -853,7 +1062,14 @@ class InfiniteTalkPipeline:
             gen_video_samples = gen_video_samples[:, :, :full_audio_emb.shape[0]]
         
         if dist.is_initialized():
-            dist.barrier()
+            with timed(
+                "dist.barrier (final)",
+                enabled=timing_on,
+                key=_tp + "dist/barrier_final",
+                log=False,
+                rank0_only=True,
+            ):
+                dist.barrier()
 
         del noise, latent
         torch_gc()
