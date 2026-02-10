@@ -10,6 +10,10 @@ set -euo pipefail
 #   W=/nas/shared/models/InfiniteTalk/weights PORT=8000 HOST=0.0.0.0 bash serving/server.sh
 #   NPROC=8 ULYSSES_SIZE=8 RING_SIZE=1 TEACACHE_THRESH=0.2 bash serving/server.sh
 
+export TRITON_PTXAS_PATH="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas"
+export TRITON_CUOBJDUMP_PATH="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/cuobjdump"
+export TRITON_NVDISASM_PATH="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/nvdisasm"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
