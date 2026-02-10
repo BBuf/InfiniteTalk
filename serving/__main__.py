@@ -34,6 +34,13 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port", type=int, default=8000, help="Server port")
     parser.add_argument("--max_queue_size", type=int, default=10, help="Max pending+running tasks")
+    parser.add_argument(
+        "--print_timing",
+        action="store_true",
+        default=False,
+        help="Print wall-clock timing for major stages (uses print + flush). "
+        "Also enabled by env INFINI_PRINT_TIMING=1",
+    )
 
     # Defaults for generation (can be overridden per request with optional fields)
     parser.add_argument("--size", type=str, default="infinitetalk-480", help="infinitetalk-480 or infinitetalk-720")
@@ -43,6 +50,8 @@ def main():
     parser.add_argument("--sample_audio_guide_scale", type=float, default=4.0, help="Audio CFG scale")
     parser.add_argument("--offload_model", action="store_true", help="Enable CPU offload between forwards")
     parser.add_argument("--max_frame_num", type=int, default=1000, help="Default max frames in streaming mode")
+    parser.add_argument("--use_teacache", action="store_true", default=False, help="Enable TeaCache by default")
+    parser.add_argument("--teacache_thresh", type=float, default=0.2, help="TeaCache threshold (default: 0.2)")
 
     # Dist / VRAM
     parser.add_argument("--t5_fsdp", action="store_true", default=False)

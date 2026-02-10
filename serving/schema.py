@@ -40,6 +40,8 @@ class BaseTaskRequest(BaseModel):
     audio_guide_scale: Optional[float] = Field(None, description="Audio CFG scale override")
     sample_shift: Optional[float] = Field(None, description="Noise schedule shift override")
     max_frame_num: Optional[int] = Field(None, description="Max frames for streaming generation override")
+    use_teacache: Optional[bool] = Field(None, description="Enable TeaCache (optional override)")
+    teacache_thresh: Optional[float] = Field(None, description="TeaCache threshold (optional override)")
 
     def __init__(self, **data):
         super().__init__(**data)

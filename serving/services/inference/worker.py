@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from loguru import logger
 
 from ..distributed_utils import DistributedManager
 from .infinitetalk_audio import audio_prepare_single, custom_init, get_embedding, save_wav_16k
+from ...utils.timing import timed_stage, timing_enabled, timing_summary_lines
 
 
 def _round_to_4n_plus_1(frames: int, min_frames: int = 5) -> int:
@@ -35,10 +37,13 @@ class TorchrunInferenceWorker:
         self.default_audio_guide_scale = 4.0
         self.default_offload_model = True
         self.default_max_frame_num = 1000
+        self.default_use_teacache = False
+        self.default_teacache_thresh = 0.2
 
     def init(self, args) -> bool:
         try:
             t0 = time.perf_counter()
+            self._timing_on = timing_enabled(args)
             try:
                 import torch  # local import for better startup ergonomics
             except ModuleNotFoundError as e:
@@ -114,6 +119,8 @@ class TorchrunInferenceWorker:
             self.default_audio_guide_scale = float(getattr(args, "sample_audio_guide_scale", self.default_audio_guide_scale) or self.default_audio_guide_scale)
             self.default_offload_model = bool(getattr(args, "offload_model", self.default_offload_model))
             self.default_max_frame_num = int(getattr(args, "max_frame_num", self.default_max_frame_num) or self.default_max_frame_num)
+            self.default_use_teacache = bool(getattr(args, "use_teacache", self.default_use_teacache))
+            self.default_teacache_thresh = float(getattr(args, "teacache_thresh", self.default_teacache_thresh))
 
             # shift default depends on size if not specified
             self.default_sample_shift = getattr(args, "sample_shift", None)
@@ -225,16 +232,25 @@ class TorchrunInferenceWorker:
             work_dir = output_path.parent / f"{task_id}_work"
             work_dir.mkdir(parents=True, exist_ok=True)
 
+            timing_on = bool(getattr(self, "_timing_on", False)) and self.rank == 0
+            timing_stats = {} if timing_on else None
+
             # Prepare audio embedding (CPU)
-            speech = audio_prepare_single(audio_path, sample_rate=16000, tmp_dir=str(work_dir))
-            audio_emb = get_embedding(speech, self.wav2vec_feature_extractor, self.audio_encoder, sr=16000, device="cpu")
+            with timed_stage("audio_prepare_single()", enabled=timing_on, stats=timing_stats):
+                speech = audio_prepare_single(audio_path, sample_rate=16000, tmp_dir=str(work_dir))
+            with timed_stage("wav2vec get_embedding()", enabled=timing_on, stats=timing_stats):
+                audio_emb = get_embedding(
+                    speech, self.wav2vec_feature_extractor, self.audio_encoder, sr=16000, device="cpu"
+                )
 
             emb_path = str(work_dir / "1.pt")
-            torch.save(audio_emb, emb_path)
+            with timed_stage("torch.save(audio_emb)", enabled=timing_on, stats=timing_stats):
+                torch.save(audio_emb, emb_path)
 
             # Also ensure we have a wav for mux/cropping
             wav_path = str(work_dir / "audio_16k.wav")
-            save_wav_16k(speech, wav_path, sr=16000)
+            with timed_stage("save_wav_16k()", enabled=timing_on, stats=timing_stats):
+                save_wav_16k(speech, wav_path, sr=16000)
 
             input_data = {
                 "prompt": prompt,
@@ -246,35 +262,57 @@ class TorchrunInferenceWorker:
             # Run pipeline (GPU heavy)
             extra_args = type("ExtraArgs", (), {})()
             # APG/TeaCache are opt-in; keep off by default.
-            extra_args.use_teacache = bool(task_data.get("use_teacache", False))
-            extra_args.teacache_thresh = float(task_data.get("teacache_thresh", 0.2))
+            extra_args.use_teacache = bool(task_data.get("use_teacache", self.default_use_teacache))
+            extra_args.teacache_thresh = float(task_data.get("teacache_thresh", self.default_teacache_thresh))
             extra_args.size = size
             extra_args.use_apg = bool(task_data.get("use_apg", False))
             extra_args.apg_momentum = float(task_data.get("apg_momentum", -0.75))
             extra_args.apg_norm_threshold = float(task_data.get("apg_norm_threshold", 55))
 
-            video_tensor = self.pipeline.generate_infinitetalk(
-                input_data,
-                size_buckget=size,
-                motion_frame=motion_frame,
-                frame_num=frame_num,
-                shift=shift,
-                sampling_steps=sampling_steps,
-                text_guide_scale=text_guide_scale,
-                audio_guide_scale=audio_guide_scale,
-                seed=seed,
-                offload_model=self.default_offload_model,
-                max_frames_num=max_frames_num if mode_streaming else frame_num,
-                color_correction_strength=float(task_data.get("color_correction_strength", 0.0)),
-                extra_args=extra_args,
-            )
+            with timed_stage("pipeline.generate_infinitetalk()", enabled=timing_on, stats=timing_stats, key="generate_infinitetalk"):
+                video_tensor = self.pipeline.generate_infinitetalk(
+                    input_data,
+                    size_buckget=size,
+                    motion_frame=motion_frame,
+                    frame_num=frame_num,
+                    shift=shift,
+                    sampling_steps=sampling_steps,
+                    text_guide_scale=text_guide_scale,
+                    audio_guide_scale=audio_guide_scale,
+                    seed=seed,
+                    offload_model=self.default_offload_model,
+                    max_frames_num=max_frames_num if mode_streaming else frame_num,
+                    color_correction_strength=float(task_data.get("color_correction_strength", 0.0)),
+                    extra_args=extra_args,
+                )
 
             if self.world_size > 1:
                 self.dist_manager.barrier()
 
             if self.rank == 0:
                 # Save mp4 with audio
-                save_video_ffmpeg(video_tensor, output_base, [wav_path], fps=fps, high_quality_save=False)
+                with timed_stage("save_video_ffmpeg()", enabled=timing_on, stats=timing_stats):
+                    save_video_ffmpeg(video_tensor, output_base, [wav_path], fps=fps, high_quality_save=False)
+
+                if timing_on:
+                    for line in timing_summary_lines(timing_stats or {}):
+                        print(line, flush=True)
+                    timing_path = str(output_path.with_suffix(output_path.suffix + ".timing.json"))
+                    try:
+                        with open(timing_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {
+                                    "task_id": task_id,
+                                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "timing": timing_stats or {},
+                                },
+                                f,
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                        print(f"[TIMING] wrote: {timing_path}", flush=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to write timing json: {e}")
 
         except Exception as e:
             has_error = True
