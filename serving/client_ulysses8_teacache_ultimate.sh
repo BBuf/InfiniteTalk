@@ -31,7 +31,7 @@ AUDIO_WAV="${AUDIO_WAV:-${ROOT}/examples/single/1.wav}"
 
 PROMPT="${PROMPT:-a person is talking}"
 INFER_STEPS="${INFER_STEPS:-40}"
-TARGET_VIDEO_LENGTH="${TARGET_VIDEO_LENGTH:-1000}"
+MAX_FRAME_NUM="${MAX_FRAME_NUM:-250}"
 SEED="${SEED:-42}"
 
 USE_TEACACHE="${USE_TEACACHE:-true}"
@@ -103,7 +103,7 @@ payload = {
   "image_path": cond_path,
   "audio_path": audio_path,
   "infer_steps": int(os.environ.get("INFER_STEPS", "40")),
-  "target_video_length": int(os.environ.get("TARGET_VIDEO_LENGTH", "1000")),
+  "max_frame_num": int(os.environ.get("MAX_FRAME_NUM", "250")),
   "seed": int(os.environ.get("SEED", "42")),
   "size": size,
   "sample_shift": shift,

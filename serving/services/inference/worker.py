@@ -227,14 +227,14 @@ class TorchrunInferenceWorker:
                 shift = float(_default_shift_for_size(size) or self.default_sample_shift)
             text_guide_scale = float(task_data.get("text_guide_scale") or self.default_text_guide_scale)
             audio_guide_scale = float(task_data.get("audio_guide_scale") or self.default_audio_guide_scale)
-            max_frames_num = int(task_data.get("max_frame_num") or task_data.get("target_video_length") or self.default_max_frame_num)
+            # NOTE:
+            # - `max_frame_num` is the ONLY supported knob for output length.
+            # - The actual produced frames will be capped by audio length internally (25 fps default).
+            max_frames_num = int(task_data.get("max_frame_num") or self.default_max_frame_num)
 
-            # Decide clip length (frame_num) and streaming total length (max_frames_num)
-            target_len = int(task_data.get("target_video_length", 81))
-            if max_frames_num < target_len:
-                max_frames_num = target_len
-            frame_num = _round_to_4n_plus_1(min(81, target_len))
-            # If user wants longer than one chunk, use streaming and max_frames_num
+            # Decide first chunk length (frame_num) and streaming total length (max_frames_num).
+            # InfiniteTalk's internal chunk is typically 81 frames; we keep it fixed here.
+            frame_num = _round_to_4n_plus_1(min(81, max_frames_num))
             mode_streaming = max_frames_num > frame_num
 
             output_path = Path(save_result_path)
