@@ -21,6 +21,7 @@ import torchvision
 import binascii
 import os.path as osp
 from skimage import color
+from wan.utils.timing import timed
 
 VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
 ASPECT_RATIO_627 = {
@@ -41,29 +42,48 @@ ASPECT_RATIO_960 = {
 
 
 def torch_gc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    # Aggregate timing into global stats when enabled.
+    with timed(
+        "torch_gc (multitalk_utils)",
+        key="runtime/torch_gc(multitalk_utils)",
+        log=False,
+        sync_cuda=False,
+        rank0_only=True,
+    ):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 
 def split_token_counts_and_frame_ids(T, token_frame, world_size, rank):
+    # High-frequency helper: aggregate timing into global stats without per-call prints.
+    # Controlled by INFINI_PRINT_TIMING (propagated from generate when --print_timing is on).
+    with timed(
+        "split_token_counts_and_frame_ids",
+        key="multitalk_utils.split_token_counts_and_frame_ids",
+        log=False,
+        rank0_only=True,
+    ):
+        S = T * token_frame
 
-    S = T * token_frame
-    split_sizes = [S // world_size + (1 if i < S % world_size else 0) for i in range(world_size)]
-    start = sum(split_sizes[:rank])
-    end = start + split_sizes[rank]
-    counts = [0] * T
-    for idx in range(start, end):
-        t = idx // token_frame
-        counts[t] += 1
+        # compute split sizes per rank
+        base = S // world_size
+        rem = S % world_size
+        split_sizes = torch.full((world_size,), base, dtype=torch.long)
+        split_sizes[:rem] += 1
 
-    counts_filtered = []
-    frame_ids = []
-    for t, c in enumerate(counts):
-        if c > 0:
-            counts_filtered.append(c)
-            frame_ids.append(t)
-    return counts_filtered, frame_ids
+        start = split_sizes[:rank].sum()
+        end = start + split_sizes[rank]
+
+        # vectorized mapping: global index -> frame id
+        idx = torch.arange(start, end, dtype=torch.long)
+        frame_ids = idx // token_frame
+
+        # unique counts
+        unique_frames, counts = torch.unique(frame_ids, return_counts=True)
+
+        # return as Python list (optional)
+        return counts.tolist(), unique_frames.tolist()
 
 
 def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):

@@ -36,66 +36,15 @@ import soundfile as sf
 import re
 
 
-@contextmanager
-def _timed_stage(name: str, enabled: bool = True, stats: dict | None = None, key: str | None = None):
-    """
-    Print timing using print() (flush=True) to avoid being swallowed by logging.
-    """
-    if not enabled:
-        yield
-        return
-    t0 = time.perf_counter()
-    print(f"[TIMING] >> {name}", flush=True)
-    try:
-        yield
-    finally:
-        dt = time.perf_counter() - t0
-        if stats is not None:
-            _timing_stats_add(stats, key or name, dt)
-        print(f"[TIMING] << {name}: {dt:.3f}s", flush=True)
-
-
-def _timing_enabled(args) -> bool:
-    # CLI flag first; then env var for convenience.
-    if getattr(args, "print_timing", False):
-        return True
-    v = os.getenv("INFINI_PRINT_TIMING", "").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-def _timing_stats_add(stats: dict, key: str, dt: float) -> None:
-    item = stats.get(key)
-    if item is None:
-        stats[key] = {
-            "count": 1,
-            "total": float(dt),
-            "min": float(dt),
-            "max": float(dt),
-        }
-        return
-    item["count"] += 1
-    item["total"] += float(dt)
-    item["min"] = min(item["min"], float(dt))
-    item["max"] = max(item["max"], float(dt))
-
-
-def _print_timing_summary(stats: dict) -> None:
-    if not stats:
-        print("[TIMING] summary: (empty)", flush=True)
-        return
-    print("[TIMING] ===== summary (count/total/avg/min/max) =====", flush=True)
-    # Keep insertion order of dict (Py3.7+), so summary follows code order.
-    for k, v in stats.items():
-        cnt = int(v["count"])
-        total = float(v["total"])
-        avg = total / max(cnt, 1)
-        mn = float(v["min"])
-        mx = float(v["max"])
-        print(
-            f"[TIMING] {k:40s} | {cnt:4d} | {total:10.3f}s | {avg:9.3f}s | {mn:9.3f}s | {mx:9.3f}s",
-            flush=True,
-        )
-    print("[TIMING] ===== end summary =====", flush=True)
+from wan.utils.timing import (
+    timed as _timed_stage,
+    timing_enabled as _timing_enabled,
+    timing_stats_add as _timing_stats_add,
+    print_timing_summary as _print_timing_summary,
+    get_global_timing_stats_copy,
+    merge_timing_stats,
+    reset_global_timing_stats,
+)
 
 
 def _validate_args(args):
@@ -528,6 +477,12 @@ def generate(args):
     device = local_rank
     _init_logging(rank)
     timing_on = _timing_enabled(args)
+    # Propagate to submodules (wan/*) so they can time themselves without plumbing args everywhere.
+    if timing_on:
+        os.environ["INFINI_PRINT_TIMING"] = "1"
+        # NOTE: optionally enable CUDA sync timing via env:
+        #   INFINI_PRINT_TIMING_SYNC_CUDA=1
+        reset_global_timing_stats()
     timing_stats = {} if (timing_on and rank == 0) else None
 
     t_all0 = time.perf_counter()
@@ -862,7 +817,11 @@ def generate(args):
         if timing_stats is not None:
             _timing_stats_add(timing_stats, "total generate()", dt_all)
         print(f"[TIMING] total generate(): {dt_all:.3f}s", flush=True)
-        _print_timing_summary(timing_stats or {})
+        # Merge global timing (from wan/* internal modules) into the top-level summary.
+        global_stats = get_global_timing_stats_copy()
+        if timing_stats is not None and global_stats:
+            merge_timing_stats(timing_stats, global_stats, prefix="wan/ ")
+        _print_timing_summary(timing_stats or global_stats or {})
 
 
 if __name__ == "__main__":
