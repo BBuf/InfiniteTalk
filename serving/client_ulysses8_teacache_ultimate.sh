@@ -30,7 +30,7 @@ REF_IMAGE="${REF_IMAGE:-${ROOT}/examples/single/ref_image.png}"
 AUDIO_WAV="${AUDIO_WAV:-${ROOT}/examples/single/1.wav}"
 
 PROMPT="${PROMPT:-a person is talking}"
-INFER_STEPS="${INFER_STEPS:-8}"
+INFER_STEPS="${INFER_STEPS:-40}"
 TARGET_VIDEO_LENGTH="${TARGET_VIDEO_LENGTH:-1000}"
 SEED="${SEED:-42}"
 
