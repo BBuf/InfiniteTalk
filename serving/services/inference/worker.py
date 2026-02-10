@@ -18,6 +18,14 @@ def _round_to_4n_plus_1(frames: int, min_frames: int = 5) -> int:
     return (max((frames - 1) // 4, 1) * 4) + 1
 
 
+def _default_shift_for_size(size: str | None) -> float | None:
+    if size == "infinitetalk-480":
+        return 7.0
+    if size == "infinitetalk-720":
+        return 11.0
+    return None
+
+
 class TorchrunInferenceWorker:
     def __init__(self):
         self.rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -212,7 +220,11 @@ class TorchrunInferenceWorker:
             # InfiniteTalk-specific overrides (optional)
             size = task_data.get("size") or self.default_size
             motion_frame = int(task_data.get("motion_frame") or self.default_motion_frame)
-            shift = float(task_data.get("sample_shift") or self.default_sample_shift)
+            # sample_shift: request-body override first; otherwise default follows requested size; else fall back to server default.
+            if "sample_shift" in task_data and task_data.get("sample_shift") is not None:
+                shift = float(task_data["sample_shift"])
+            else:
+                shift = float(_default_shift_for_size(size) or self.default_sample_shift)
             text_guide_scale = float(task_data.get("text_guide_scale") or self.default_text_guide_scale)
             audio_guide_scale = float(task_data.get("audio_guide_scale") or self.default_audio_guide_scale)
             max_frames_num = int(task_data.get("max_frame_num") or task_data.get("target_video_length") or self.default_max_frame_num)

@@ -145,6 +145,46 @@ torchrun --nproc_per_node=4 infinitetalk-serving \
 }
 ```
 
+#### `sample_shift`（推荐在请求体按分辨率控制）
+
+serving 支持在请求体里传 `sample_shift`。如果你只传了 `size` 没传 `sample_shift`，serving 会自动使用默认值：
+- `infinitetalk-480` → `sample_shift = 7`
+- `infinitetalk-720` → `sample_shift = 11`
+
+示例（480P）：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a person is talking",
+    "image_path": "examples/single/ref_video.mp4",
+    "audio_path": "examples/single/1.wav",
+    "infer_steps": 8,
+    "target_video_length": 1000,
+    "seed": 42,
+    "size": "infinitetalk-480",
+    "sample_shift": 7
+  }'
+```
+
+示例（720P）：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a person is talking",
+    "image_path": "examples/single/ref_video.mp4",
+    "audio_path": "examples/single/1.wav",
+    "infer_steps": 8,
+    "target_video_length": 1000,
+    "seed": 42,
+    "size": "infinitetalk-720",
+    "sample_shift": 11
+  }'
+```
+
 #### TeaCache（可选）
 
 你可以在**启动服务时**开启 TeaCache（作为默认值）：
