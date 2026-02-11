@@ -97,44 +97,61 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
 
 
 @torch.compile
-def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
-    
-    ref_k = ref_k.to(visual_q.dtype).to(visual_q.device)
-    scale = 1.0 / visual_q.shape[-1] ** 0.5
-    visual_q = visual_q * scale
-    visual_q = visual_q.transpose(1, 2)
-    ref_k = ref_k.transpose(1, 2)
-    attn = visual_q @ ref_k.transpose(-2, -1)
+def _calculate_x_ref_attn_map_compiled(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
+    """
+    Compute attention maps between visual queries and reference keys, then aggregate by class masks.
 
+    Output shape matches the original implementation: [class_num * B, x_seqlens]
+    """
+    # Ensure dtype/device alignment (ref_k may come from a different dtype/device).
+    ref_k = ref_k.to(dtype=visual_q.dtype, device=visual_q.device)
+
+    # Attention logits -> probs: [B, H, X, R]
+    scale = visual_q.shape[-1] ** (-0.5)
+    q = (visual_q * scale).transpose(1, 2)
+    k = ref_k.transpose(1, 2)
+    attn = q @ k.transpose(-2, -1)
     if attn_bias is not None:
         attn = attn + attn_bias
+    attn_probs = attn.softmax(-1).to(q.dtype)
 
-    x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
+    # Masks: [C, R] -> normalized weights per class.
+    masks = ref_target_masks.to(dtype=q.dtype, device=q.device)
+    denom = masks.sum(dim=-1).clamp_min(1e-8)  # [C]
+    # [B, H, X, R] @ [R, C] -> [B, H, X, C]
+    num = attn_probs.matmul(masks.transpose(0, 1))
+    out = num / denom  # broadcast over C
+
+    # Reduce heads, format to [C*B, X]
+    if mode == 'mean':
+        out_cbx = out.mean(dim=1).permute(2, 0, 1)  # [C, B, X]
+    elif mode == 'max':
+        out_cbx = out.max(dim=1).values.permute(2, 0, 1)  # [C, B, X]
+    else:
+        # keep backward-compat with original behavior
+        out_cbx = out.mean(dim=1).permute(2, 0, 1)
+    return out_cbx.reshape(-1, out_cbx.shape[-1])
 
 
-    x_ref_attn_maps = []
-    ref_target_masks = ref_target_masks.to(visual_q.dtype)
-    x_ref_attn_map_source = x_ref_attn_map_source.to(visual_q.dtype)
-
-    for class_idx, ref_target_mask in enumerate(ref_target_masks):
-        torch_gc()
-        ref_target_mask = ref_target_mask[None, None, None, ...]
-        x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
-        x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
-        x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
-       
-        if mode == 'mean':
-            x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
-        elif mode == 'max':
-            x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
-        
-        x_ref_attn_maps.append(x_ref_attnmap)
-    
-    del attn
-    del x_ref_attn_map_source
-    torch_gc()
-
-    return torch.concat(x_ref_attn_maps, dim=0)
+def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
+    """
+    Timing wrapper around the compiled implementation.
+    Note: The first call may include torch.compile warmup/compile overhead.
+    """
+    with timed(
+        "calculate_x_ref_attn_map",
+        key="multitalk_utils.calculate_x_ref_attn_map",
+        log=False,
+        sync_cuda=False,
+        rank0_only=True,
+    ):
+        return _calculate_x_ref_attn_map_compiled(
+            visual_q,
+            ref_k,
+            ref_target_masks,
+            mode=mode,
+            attn_bias=attn_bias,
+        )
 
 
 def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
@@ -145,23 +162,48 @@ def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, spli
         ref_target_masks: [B, N_h * N_w]
     """
 
-    N_t, N_h, N_w = shape
-    if enable_sp:
-        ref_k = get_sp_group().all_gather(ref_k, dim=1)
-    
-    x_seqlens = N_h * N_w
-    ref_k     = ref_k[:, :x_seqlens]
-    _, seq_lens, heads, _ = visual_q.shape
-    class_num, _ = ref_target_masks.shape
-    x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
+    with timed(
+        "get_attn_map_with_target",
+        key="multitalk_utils.get_attn_map_with_target",
+        log=False,
+        sync_cuda=False,
+        rank0_only=True,
+    ):
+        N_t, N_h, N_w = shape
+        if enable_sp:
+            with timed(
+                "get_attn_map_with_target: sp all_gather(ref_k)",
+                key="multitalk_utils.get_attn_map_with_target/sp_all_gather_ref_k",
+                log=False,
+                sync_cuda=False,
+                rank0_only=True,
+            ):
+                ref_k = get_sp_group().all_gather(ref_k, dim=1)
 
-    split_chunk = heads // split_num
-    
-    for i in range(split_num):
-        x_ref_attn_maps_perhead = calculate_x_ref_attn_map(visual_q[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_k[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_target_masks)
-        x_ref_attn_maps += x_ref_attn_maps_perhead
-    
-    return x_ref_attn_maps / split_num
+        x_seqlens = N_h * N_w
+        ref_k     = ref_k[:, :x_seqlens]
+        _, seq_lens, heads, _ = visual_q.shape
+        class_num, _ = ref_target_masks.shape
+        x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
+
+        split_chunk = heads // split_num
+
+        for i in range(split_num):
+            with timed(
+                f"get_attn_map_with_target: split {i}/{split_num}",
+                key=f"multitalk_utils.get_attn_map_with_target/split_{i}",
+                log=False,
+                sync_cuda=False,
+                rank0_only=True,
+            ):
+                x_ref_attn_maps_perhead = calculate_x_ref_attn_map(
+                    visual_q[:, :, i * split_chunk:(i + 1) * split_chunk, :],
+                    ref_k[:, :, i * split_chunk:(i + 1) * split_chunk, :],
+                    ref_target_masks,
+                )
+            x_ref_attn_maps += x_ref_attn_maps_perhead
+
+        return x_ref_attn_maps / split_num
 
 
 def rotate_half(x):
