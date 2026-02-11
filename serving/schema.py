@@ -55,7 +55,6 @@ class BaseTaskRequest(BaseModel):
 class VideoTaskRequest(BaseTaskRequest):
     # Keep fields identical to LightX2V.
     num_fragments: int = Field(1, description="Number of fragments")
-    target_video_length: int = Field(81, description="Target video length (frames)")
     audio_path: str = Field("", description="Input audio path")
     video_duration: int = Field(5, description="(compat) Video duration")
     talk_objects: Optional[list[TalkObject]] = Field(None, description="(compat) Talk objects")

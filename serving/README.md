@@ -82,7 +82,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
     "image_path": "examples/single/ref_video.mp4",
     "audio_path": "examples/single/1.wav",
     "infer_steps": 4,
-    "target_video_length": 1000,
+    "max_frame_num": 250,
     "seed": 42,
     "size": "infinitetalk-480"
   }'
@@ -140,9 +140,55 @@ torchrun --nproc_per_node=4 infinitetalk-serving \
   "image_path": "examples/single/ref_video.mp4",
   "audio_path": "examples/single/1.wav",
   "infer_steps": 40,
-  "target_video_length": 1000,
+  "max_frame_num": 250,
   "seed": 42
 }
+```
+
+#### `sample_shift`（推荐在请求体按分辨率控制）
+
+serving 支持在请求体里传 `sample_shift`。如果你只传了 `size` 没传 `sample_shift`，serving 会自动使用默认值：
+- `infinitetalk-480` → `sample_shift = 7`
+- `infinitetalk-720` → `sample_shift = 11`
+
+#### 生成长度（只认 `max_frame_num`）
+
+- `max_frame_num`：**生成视频最大帧数**（例如 25fps 下，250 帧 ≈ 10 秒）
+- 实际输出帧数会与**音频可用长度**取最小值（内部按 25fps 对齐）
+- `target_video_length` 是从 LightX2V 兼容字段遗留的参数，**在 InfiniteTalk serving 中不再支持/不再生效**
+
+示例（480P）：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a person is talking",
+    "image_path": "examples/single/ref_video.mp4",
+    "audio_path": "examples/single/1.wav",
+    "infer_steps": 8,
+    "max_frame_num": 250,
+    "seed": 42,
+    "size": "infinitetalk-480",
+    "sample_shift": 7
+  }'
+```
+
+示例（720P）：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a person is talking",
+    "image_path": "examples/single/ref_video.mp4",
+    "audio_path": "examples/single/1.wav",
+    "infer_steps": 8,
+    "max_frame_num": 250,
+    "seed": 42,
+    "size": "infinitetalk-720",
+    "sample_shift": 11
+  }'
 ```
 
 #### TeaCache（可选）
@@ -163,7 +209,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video" \
     "image_path": "examples/single/ref_video.mp4",
     "audio_path": "examples/single/1.wav",
     "infer_steps": 8,
-    "target_video_length": 1000,
+    "max_frame_num": 250,
     "seed": 42,
     "size": "infinitetalk-480",
     "use_teacache": true,
@@ -185,7 +231,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video/" \
     "image_path": "examples/single/ref_video.mp4",
     "audio_path": "examples/single/1.wav",
     "infer_steps": 40,
-    "target_video_length": 1000,
+    "max_frame_num": 250,
     "seed": 42,
     "size": "infinitetalk-480"
   }'
@@ -201,7 +247,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video/" \
     "image_path": "examples/single/ref_image.png",
     "audio_path": "examples/single/1.wav",
     "infer_steps": 40,
-    "target_video_length": 300,
+    "max_frame_num": 250,
     "seed": 42,
     "size": "infinitetalk-480"
   }'
@@ -237,7 +283,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tasks/video/form" \
   -F "audio_file=@examples/single/1.wav" \
   -F "prompt=a person is talking" \
   -F "infer_steps=40" \
-  -F "target_video_length=1000" \
+  -F "max_frame_num=250" \
   -F "seed=42"
 ```
 
