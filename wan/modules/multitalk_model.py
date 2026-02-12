@@ -21,6 +21,8 @@ try:
 except:
     USE_SAGEATTN = False
 
+from .triton_ops import norm_infer, rms_norm_fn
+
 __all__ = ['WanModel']
 
 
@@ -76,8 +78,43 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
-class WanRMSNorm(nn.Module):
+# class WanRMSNorm(nn.Module):
 
+#     def __init__(self, dim, eps=1e-5):
+#         super().__init__()
+#         self.dim = dim
+#         self.eps = eps
+#         self.weight = nn.Parameter(torch.ones(dim))
+
+#     def forward(self, x):
+#         r"""
+#         Args:
+#             x(Tensor): Shape [B, L, C]
+#         """
+#         return self._norm(x.float()).type_as(x) * self.weight
+
+#     def _norm(self, x):
+#         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
+# class WanLayerNorm(nn.LayerNorm):
+
+#     def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+#         super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+
+#     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+#         origin_dtype = inputs.dtype
+#         out = F.layer_norm(
+#             inputs.float(), 
+#             self.normalized_shape, 
+#             None if self.weight is None else self.weight.float(), 
+#             None if self.bias is None else self.bias.float() ,
+#             self.eps
+#         ).to(origin_dtype)
+#         return out
+
+
+class WanRMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.dim = dim
@@ -85,31 +122,33 @@ class WanRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-        """
-        return self._norm(x.float()).type_as(x) * self.weight
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return rms_norm_fn(x, self.weight, bias=None, eps=self.eps)
 
 
-class WanLayerNorm(nn.LayerNorm):
-
-    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
-        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+class WanLayerNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6, elementwise_affine=False, bias=True):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+            self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        origin_dtype = inputs.dtype
-        out = F.layer_norm(
-            inputs.float(), 
-            self.normalized_shape, 
-            None if self.weight is None else self.weight.float(), 
-            None if self.bias is None else self.bias.float() ,
-            self.eps
-        ).to(origin_dtype)
-        return out
+        shape = inputs.shape
+        x_2d = inputs.reshape(-1, shape[-1])
+        out = norm_infer(
+            x_2d,
+            self.weight,
+            self.bias,
+            eps=self.eps,
+            is_rms_norm=False,
+        )
+        return out.view(shape)
 
 
 class WanSelfAttention(nn.Module):
