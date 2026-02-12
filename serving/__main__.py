@@ -61,6 +61,8 @@ def main():
     parser.add_argument("--t5_cpu", action="store_true", default=False)
     parser.add_argument("--num_persistent_param_in_dit", type=int, default=None)
 
+    parser.add_argument("--enable_torch_compile", action="store_true")
+
     args, _unknown = parser.parse_known_args()
     run_server(args)
 
